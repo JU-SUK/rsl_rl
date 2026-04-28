@@ -50,7 +50,7 @@ class WandbSummaryWriter(SummaryWriter):
         )
         run_id = cfg.get("run_id")
         if run_id is not None:
-            wandb_kwargs["id"] = f"slurm-{run_id}"
+            wandb_kwargs["id"] = str(run_id)
             wandb_kwargs["resume"] = "allow"
         wandb.init(**wandb_kwargs)
 

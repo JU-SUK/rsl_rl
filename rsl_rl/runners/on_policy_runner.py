@@ -140,7 +140,7 @@ class OnPolicyRunner:
         saved_dict["infos"] = infos
         if self.cfg.get("save_curriculum_state", True):
             curriculum_state = self._get_curriculum_state()
-            if curriculum_state is not None:
+            if curriculum_state:
                 saved_dict["curriculum_state"] = curriculum_state
         torch.save(saved_dict, path)
         # Upload model to external logging services
