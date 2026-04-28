@@ -445,18 +445,13 @@ class PPO:
         return alg
 
     def broadcast_parameters(self) -> None:
-        """Broadcast model parameters to all GPUs."""
-        # Obtain the model parameters on current GPU
-        model_params = [self._raw_actor.state_dict(), self._raw_critic.state_dict()]
+        """Broadcast model parameters and buffers to all GPUs."""
+        modules = [self._raw_actor, self._raw_critic]
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
-        # Broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # Load the model parameters on all GPUs from source GPU
-        self._raw_actor.load_state_dict(model_params[0])
-        self._raw_critic.load_state_dict(model_params[1])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[2])
+            modules.append(self.rnd.predictor)
+        for module in modules:
+            for tensor in chain(module.parameters(), module.buffers()):
+                torch.distributed.broadcast(tensor.data, src=0)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
