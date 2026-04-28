@@ -138,6 +138,10 @@ class OnPolicyRunner:
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
+        if self.cfg.get("save_curriculum_state", True):
+            curriculum_state = self._get_curriculum_state()
+            if curriculum_state is not None:
+                saved_dict["curriculum_state"] = curriculum_state
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
@@ -158,7 +162,25 @@ class OnPolicyRunner:
         load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
         if load_iteration:
             self.current_learning_iteration = loaded_dict["iter"]
+        if not self.cfg.get("reset_curriculum_on_load", False) and "curriculum_state" in loaded_dict:
+            self._set_curriculum_state(loaded_dict["curriculum_state"])
         return loaded_dict["infos"]
+
+    def _get_curriculum_state(self) -> dict | None:
+        """Return the curriculum manager's serializable state, or ``None`` if unavailable."""
+        env = getattr(self.env, "unwrapped", self.env)
+        manager = getattr(env, "curriculum_manager", None)
+        if manager is None or not hasattr(manager, "state_dict"):
+            return None
+        return manager.state_dict()
+
+    def _set_curriculum_state(self, state: dict) -> None:
+        """Restore curriculum state previously produced by :meth:`_get_curriculum_state`."""
+        env = getattr(self.env, "unwrapped", self.env)
+        manager = getattr(env, "curriculum_manager", None)
+        if manager is None or not hasattr(manager, "load_state_dict"):
+            return
+        manager.load_state_dict(state)
 
     def get_inference_policy(self, device: str | None = None) -> MLPModel:
         """Return the policy on the requested device for inference."""
