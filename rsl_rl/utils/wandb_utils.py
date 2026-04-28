@@ -37,25 +37,38 @@ class WandbSummaryWriter(SummaryWriter):
         except KeyError:
             entity = None
 
-        # Initialize wandb
-        wandb.init(
+        # Initialize wandb. When the runner config provides a ``run_id`` (typically the
+        # SLURM job id, propagated from ``train.py --run_id``), use it as a deterministic
+        # wandb run id so a requeued cluster job resumes the same dashboard run instead
+        # of starting a new one.
+        wandb_kwargs: dict = dict(
             project=project,
             entity=entity,
             name=run_name,
             config={"log_dir": log_dir},
             settings=wandb.Settings(start_method="thread"),
         )
+        run_id = cfg.get("run_id")
+        if run_id is not None:
+            wandb_kwargs["id"] = f"slurm-{run_id}"
+            wandb_kwargs["resume"] = "allow"
+        wandb.init(**wandb_kwargs)
 
         # Initialize set to keep track of logged videos
         self.logged_videos: set[str] = set()
 
     def store_config(self, env_cfg: dict | object, train_cfg: dict) -> None:
-        """Upload environment and training configuration to W&B."""
-        wandb.config.update({"train_cfg": train_cfg})
+        """Upload environment and training configuration to W&B.
+
+        ``allow_val_change=True`` is required because ``store_config`` runs on every job
+        attempt; on a resumed run the keys already exist and wandb's strict mode would
+        otherwise raise a config conflict even when the values are unchanged.
+        """
+        wandb.config.update({"train_cfg": train_cfg}, allow_val_change=True)
         try:
-            wandb.config.update({"env_cfg": env_cfg.to_dict()})  # type: ignore
+            wandb.config.update({"env_cfg": env_cfg.to_dict()}, allow_val_change=True)  # type: ignore
         except Exception:
-            wandb.config.update({"env_cfg": asdict(env_cfg)})  # type: ignore
+            wandb.config.update({"env_cfg": asdict(env_cfg)}, allow_val_change=True)  # type: ignore
 
     def add_scalar(
         self,
