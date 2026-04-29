@@ -230,19 +230,19 @@ class PPO:
             if self.symmetry:
                 self.symmetry.augment_batch(batch, original_batch_size)
 
-            # Recompute actions log prob and entropy for current batch of transitions
-            # Note: We need to do this because we updated the policy with new parameters
-            self.actor(
-                batch.observations,
-                masks=batch.masks,
-                hidden_state=batch.hidden_states[0],
-                stochastic_output=True,
-            )
-            actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
-            values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
-            # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
-            distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
-            entropy = self.actor.output_entropy[:original_batch_size]
+            # In within_minibatch mode, capture RNG state *before* the full-batch forward.
+            # The full-batch forward calls ``actor(stochastic_output=True)`` which advances RNG
+            # via ``Normal.sample()`` (B random draws, one per sample). The shard backwards below
+            # would then consume *another* B draws, doubling RNG consumption per minibatch and
+            # perturbing every subsequent rollout's action samples. Restoring RNG to this state
+            # before the shard forwards makes within_minibatch RNG-equivalent to disabled: both
+            # advance RNG by exactly B per minibatch, drawing the same numbers in the same order.
+            saved_rng_state: dict | None = None
+            if grad_noise_mode == "within_minibatch":
+                saved_rng_state = self._capture_rng_state()
+
+            # Full-batch forward (also needed by KL+LR adaptation below).
+            actions_log_prob, values, distribution_params, entropy = self._forward_for_loss(batch, original_batch_size)
 
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -272,24 +272,10 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+            # PPO loss (surrogate + value + entropy)
+            loss, surrogate_loss, value_loss = self._compute_ppo_loss(
+                batch, actions_log_prob, values, entropy, original_batch_size
             )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
-
-            # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                value_losses = (values - batch.returns).pow(2)
-                value_losses_clipped = (value_clipped - batch.returns).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (batch.returns - values).pow(2).mean()
-
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
 
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -300,13 +286,34 @@ class PPO:
                 if self.symmetry.use_mirror_loss:
                     loss = loss + self.symmetry.mirror_loss_coeff * symmetry_loss
 
-            # Compute the gradients for PPO
-            self.optimizer.zero_grad()
-            loss.backward()
-            # Compute the gradients for RND
-            if self.rnd:
-                self.rnd.optimizer.zero_grad()
-                rnd_loss.backward()
+            # Backward (mode-specific): within_minibatch runs M shard backwards into a separate
+            # accumulator and writes the averaged grad into p.grad; all other modes use the
+            # standard single full-batch backward.
+            if grad_noise_mode == "within_minibatch":
+                # Restore RNG state so the shard forwards draw exactly the same B random numbers
+                # as the disabled-mode full-batch forward — see the rationale at ``saved_rng_state``.
+                assert saved_rng_state is not None
+                self._restore_rng_state(saved_rng_state)
+                shard_norm_sqs, averaged_grad = self._sharded_backward(batch, original_batch_size)
+                for buf, param in zip(averaged_grad, self._actor_critic_parameters()):
+                    if param.grad is None:
+                        param.grad = buf
+                    else:
+                        param.grad.copy_(buf)
+                big_norm_sq = self.noise_scale_tracker.grad_norm_sq(self._actor_critic_parameters())
+                shard_size = original_batch_size // self.noise_scale_tracker.num_micro_shards
+                self.noise_scale_tracker.step_within_minibatch(
+                    shard_norm_sqs,
+                    big_norm_sq,
+                    b_small=shard_size,
+                    b_big=original_batch_size,
+                )
+            else:
+                self.optimizer.zero_grad()
+                loss.backward()
+                if self.rnd:
+                    self.rnd.optimizer.zero_grad()
+                    rnd_loss.backward()
 
             # Gradient noise scale: pre-reduce hooks (read-only on p.grad)
             local_grad_norm_sq: torch.Tensor | None = None
@@ -545,10 +552,19 @@ class PPO:
                 "use mode='auto' or mode='across_minibatches' on a single GPU."
             )
         if mode == "within_minibatch":
-            raise NotImplementedError(f"gradient noise scale mode={mode!r} is not implemented yet.")
+            if self.symmetry is not None:
+                raise NotImplementedError(
+                    "gradient noise scale mode='within_minibatch' is not implemented for symmetry-augmented batches."
+                )
+            if self.rnd is not None:
+                raise NotImplementedError("gradient noise scale mode='within_minibatch' is not implemented for RND.")
+            if self.actor.is_recurrent or self.critic.is_recurrent:
+                raise NotImplementedError(
+                    "gradient noise scale mode='within_minibatch' is not implemented for recurrent actors/critics."
+                )
         ema_decay = cfg.pop("ema_decay", 0.99)
         eps = cfg.pop("eps", 1e-12)
-        cfg.pop("num_micro_shards", None)  # accepted for forward-compat with within_minibatch mode
+        num_micro_shards = cfg.pop("num_micro_shards", 2)
         if cfg:
             raise ValueError(f"unrecognized keys in gradient_noise_scale_cfg: {sorted(cfg.keys())}")
         return GradientNoiseScaleTracker(
@@ -556,6 +572,7 @@ class PPO:
             ema_decay=ema_decay,
             is_multi_gpu=self.is_multi_gpu,
             gpu_world_size=self.gpu_world_size,
+            num_micro_shards=num_micro_shards,
             device=self.device,
             eps=eps,
         )
@@ -563,3 +580,132 @@ class PPO:
     def _actor_critic_parameters(self) -> list[torch.nn.Parameter]:
         """Return actor + critic parameters (excluding RND) for the noise-scale tracker."""
         return list(chain(self.actor.parameters(), self.critic.parameters()))
+
+    def _forward_for_loss(
+        self, batch: TensorDict, original_batch_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...], torch.Tensor]:
+        """Run the actor + critic forward, returning the components used by PPO loss + KL adapter.
+
+        Returns ``(actions_log_prob, values, distribution_params, entropy)``. The
+        distribution params and entropy are sliced to ``original_batch_size`` so callers
+        do not see symmetry-augmented mirrors.
+        """
+        self.actor(
+            batch.observations,
+            masks=batch.masks,
+            hidden_state=batch.hidden_states[0],
+            stochastic_output=True,
+        )
+        actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore
+        values = self.critic(batch.observations, masks=batch.masks, hidden_state=batch.hidden_states[1])
+        distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
+        entropy = self.actor.output_entropy[:original_batch_size]
+        return actions_log_prob, values, distribution_params, entropy
+
+    def _compute_ppo_loss(
+        self,
+        batch: TensorDict,
+        actions_log_prob: torch.Tensor,
+        values: torch.Tensor,
+        entropy: torch.Tensor,
+        original_batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute PPO surrogate + value + entropy loss given precomputed forward outputs.
+
+        Returns ``(loss, surrogate_loss, value_loss)``. ``loss`` is the combined PPO
+        objective; the other two are returned for logging.
+        """
+        ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+        surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
+        surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
+            ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+        )
+        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+
+        if self.use_clipped_value_loss:
+            value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
+            value_losses = (values - batch.returns).pow(2)
+            value_losses_clipped = (value_clipped - batch.returns).pow(2)
+            value_loss = torch.max(value_losses, value_losses_clipped).mean()
+        else:
+            value_loss = (batch.returns - values).pow(2).mean()
+
+        loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+        return loss, surrogate_loss, value_loss
+
+    def _sharded_backward(
+        self, batch: TensorDict, original_batch_size: int
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Run M = ``num_micro_shards`` shard backwards into a separate accumulator.
+
+        Used by the ``within_minibatch`` gradient-noise-scale mode. For each shard,
+        zeroes ``p.grad``, runs forward + loss + backward on the shard, records the
+        per-shard ``|g_k|^2``, and adds ``(1/M) * p.grad`` to the accumulator. The
+        averaged accumulator is then written back into ``p.grad`` by the caller before
+        ``optimizer.step()`` runs.
+
+        Returns ``(shard_norm_sqs, averaged_grad)``: ``shard_norm_sqs`` is M scalar
+        tensors (one per shard), and ``averaged_grad`` is one tensor per actor+critic
+        parameter holding ``(1/M) * sum_k g_k``.
+        """
+        num_shards = self.noise_scale_tracker.num_micro_shards
+        if original_batch_size % num_shards != 0:
+            raise ValueError(
+                f"within_minibatch requires the minibatch size ({original_batch_size}) to be divisible by "
+                f"num_micro_shards ({num_shards})."
+            )
+        shard_size = original_batch_size // num_shards
+        actor_critic_params = self._actor_critic_parameters()
+        averaged_grad = [torch.zeros_like(p) for p in actor_critic_params]
+        shard_norm_sqs: list[torch.Tensor] = []
+
+        for k in range(num_shards):
+            shard = self._slice_batch(batch, k * shard_size, (k + 1) * shard_size)
+            self.optimizer.zero_grad()
+            log_prob, shard_values, _dist_params, shard_entropy = self._forward_for_loss(shard, shard_size)
+            shard_loss, _, _ = self._compute_ppo_loss(shard, log_prob, shard_values, shard_entropy, shard_size)
+            shard_loss.backward()
+            shard_norm_sqs.append(self.noise_scale_tracker.grad_norm_sq(actor_critic_params))
+            for buf, param in zip(averaged_grad, actor_critic_params):
+                if param.grad is not None:
+                    buf.add_(param.grad / num_shards)
+
+        return shard_norm_sqs, averaged_grad
+
+    def _capture_rng_state(self) -> dict:
+        """Snapshot the CPU and (if applicable) device-resident CUDA RNG state."""
+        state: dict = {"cpu": torch.get_rng_state()}
+        device = torch.device(self.device)
+        if device.type == "cuda":
+            state["cuda"] = torch.cuda.get_rng_state(device)
+        return state
+
+    def _restore_rng_state(self, state: dict) -> None:
+        """Restore the CPU and (if applicable) device-resident CUDA RNG state."""
+        torch.set_rng_state(state["cpu"])
+        if "cuda" in state:
+            torch.cuda.set_rng_state(state["cuda"], torch.device(self.device))
+
+    @staticmethod
+    def _slice_batch(batch: RolloutStorage.Batch, start: int, end: int) -> RolloutStorage.Batch:
+        """Slice a non-recurrent, non-symmetry-augmented :class:`RolloutStorage.Batch` along the batch axis.
+
+        Used by :meth:`_sharded_backward` for the ``within_minibatch`` mode. Only handles
+        the fields populated in the standard RL path (no recurrent hidden states, no
+        distillation-only fields).
+        """
+        return RolloutStorage.Batch(
+            observations=batch.observations[start:end] if batch.observations is not None else None,
+            actions=batch.actions[start:end] if batch.actions is not None else None,
+            values=batch.values[start:end] if batch.values is not None else None,
+            advantages=batch.advantages[start:end] if batch.advantages is not None else None,
+            returns=batch.returns[start:end] if batch.returns is not None else None,
+            old_actions_log_prob=(
+                batch.old_actions_log_prob[start:end] if batch.old_actions_log_prob is not None else None
+            ),
+            old_distribution_params=(
+                tuple(p[start:end] for p in batch.old_distribution_params)
+                if batch.old_distribution_params is not None
+                else None
+            ),
+        )

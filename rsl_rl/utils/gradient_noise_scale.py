@@ -52,6 +52,8 @@ class GradientNoiseScaleTracker:
         is_multi_gpu: Whether ``torch.distributed`` is initialized; controls
             whether :meth:`step_ddp_native` performs the cross-rank all-reduce.
         gpu_world_size: World size; only used when ``mode='ddp_native'``.
+        num_micro_shards: Number of shards per minibatch when
+            ``mode='within_minibatch'``. Unused for other modes. Must be >= 2.
         device: Device for the EMA state tensors.
         eps: Lower clamp on ``EMA(|G|^2)`` to prevent divide-by-zero in
             :meth:`state`.
@@ -63,6 +65,7 @@ class GradientNoiseScaleTracker:
         ema_decay: float = 0.99,
         is_multi_gpu: bool = False,
         gpu_world_size: int = 1,
+        num_micro_shards: int = 2,
         device: str | torch.device = "cpu",
         eps: float = 1e-12,
     ) -> None:
@@ -73,11 +76,14 @@ class GradientNoiseScaleTracker:
             raise ValueError(f"ema_decay must be in (0, 1), got {ema_decay}.")
         if gpu_world_size < 1:
             raise ValueError(f"gpu_world_size must be >= 1, got {gpu_world_size}.")
+        if num_micro_shards < 2:
+            raise ValueError(f"num_micro_shards must be >= 2, got {num_micro_shards}.")
 
         self.mode: Mode = mode
         self.ema_decay = float(ema_decay)
         self.is_multi_gpu = bool(is_multi_gpu)
         self.gpu_world_size = int(gpu_world_size)
+        self.num_micro_shards = int(num_micro_shards)
         self.device = torch.device(device)
         self.eps = float(eps)
 

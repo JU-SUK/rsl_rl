@@ -439,10 +439,81 @@ class TestGradientNoiseScaleIntegration:
         # After one update the denominator EMA must have moved off its initial zero.
         assert loss_dict["noise_scale/G_sq"] != 0.0
 
-    def test_within_minibatch_mode_still_unimplemented(self) -> None:
-        """The within_minibatch mode is reserved but not implemented yet."""
-        with pytest.raises(NotImplementedError, match="within_minibatch"):
-            self._build_runner_with_grad_noise_cfg({"enabled": True, "mode": "within_minibatch"})
+    def test_metric_present_when_within_minibatch_enabled(self) -> None:
+        """within_minibatch mode populates B_simple, G_sq, sigma_tr in loss_dict."""
+        runner = self._build_runner_with_grad_noise_cfg({
+            "enabled": True,
+            "mode": "within_minibatch",
+            "num_micro_shards": 2,
+        })
+        assert runner.alg.noise_scale_tracker is not None
+        assert runner.alg.noise_scale_tracker.mode == "within_minibatch"
+        loss_dict = self._run_one_update(runner)
+        assert "noise_scale/B_simple" in loss_dict
+        assert "noise_scale/G_sq" in loss_dict
+        assert "noise_scale/sigma_tr" in loss_dict
+
+    def test_within_minibatch_deterministic_given_seed(self) -> None:
+        """Two seeded runs in within_minibatch mode produce byte-equal parameters."""
+
+        def seeded_run() -> dict[str, torch.Tensor]:
+            torch.manual_seed(123)
+            runner = self._build_runner_with_grad_noise_cfg({
+                "enabled": True,
+                "mode": "within_minibatch",
+                "num_micro_shards": 2,
+            })
+            runner.learn(num_learning_iterations=2)
+            return {k: v.clone() for k, v in runner.alg.actor.state_dict().items()}
+
+        params_a = seeded_run()
+        params_b = seeded_run()
+        for key in params_a:
+            assert torch.equal(params_a[key], params_b[key]), (
+                f"actor param '{key}' differs across seeded within_minibatch runs"
+            )
+
+    def test_within_minibatch_diverges_from_disabled(self) -> None:
+        """within_minibatch is allclose-but-not-bit-equal to disabled (float-order divergence only).
+
+        The implementation captures and restores RNG around the full-batch forward so that
+        ``Normal.sample()``'s side effect does not propagate to subsequent rollouts. Without
+        that fix, the two runs would diverge by orders of magnitude more than float-order
+        because the rollouts would draw different actions. This test catches a regression
+        in either direction:
+
+        - bit-equal (no diff at all): shard accumulation accidentally preserves full-batch
+          reduction order, OR num_micro_shards=1 was used.
+        - not allclose (large diff): RNG-restore broke and within_minibatch is consuming
+          extra randomness, OR a real numerical bug was introduced.
+        """
+
+        def seeded_run(grad_noise_cfg: dict | None) -> dict[str, torch.Tensor]:
+            torch.manual_seed(123)
+            runner = self._build_runner_with_grad_noise_cfg(grad_noise_cfg)
+            runner.learn(num_learning_iterations=2)
+            return {k: v.clone() for k, v in runner.alg.actor.state_dict().items()}
+
+        params_off = seeded_run(None)
+        params_within = seeded_run({"enabled": True, "mode": "within_minibatch", "num_micro_shards": 2})
+        any_diff = any(not torch.equal(params_off[k], params_within[k]) for k in params_off)
+        assert any_diff, (
+            "within_minibatch parameters were bit-equal to disabled — float-order should differ. "
+            "Audit shard accumulation order or check that num_micro_shards >= 2."
+        )
+        for key in params_off:
+            assert torch.allclose(params_off[key], params_within[key], rtol=1e-3, atol=1e-4), (
+                f"actor param '{key}' diverged beyond float-order tolerance — likely a regression "
+                "in the RNG-restore path or a numerical bug."
+            )
+
+    def test_within_minibatch_rejects_recurrent(self) -> None:
+        """v1 restriction: within_minibatch errors at construction time on recurrent actors."""
+        with pytest.raises(NotImplementedError, match="recurrent"):
+            env = DummyEnv()
+            cfg = _make_train_cfg("rnn")
+            cfg["algorithm"]["gradient_noise_scale_cfg"] = {"enabled": True, "mode": "within_minibatch"}
+            OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
 
     def test_explicit_ddp_native_requires_multi_gpu(self) -> None:
         """mode='ddp_native' must error on single-GPU (b_big == b_small would div-by-zero)."""
