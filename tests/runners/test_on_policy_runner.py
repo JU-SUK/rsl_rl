@@ -8,14 +8,19 @@
 from __future__ import annotations
 
 import copy
+import math
+import os
+import socket
 import tempfile
 import torch
+import torch.multiprocessing as mp
 from tensordict import TensorDict
 
 import pytest
 
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
+from tests.algorithms.test_ppo import _build_ppo
 
 NUM_ENVS = 4
 OBS_DIM = 8
@@ -434,10 +439,31 @@ class TestGradientNoiseScaleIntegration:
         # After one update the denominator EMA must have moved off its initial zero.
         assert loss_dict["noise_scale/G_sq"] != 0.0
 
-    def test_unimplemented_mode_raises(self) -> None:
-        """Requesting a mode that has not landed yet should raise NotImplementedError."""
-        with pytest.raises(NotImplementedError, match="ddp_native"):
+    def test_within_minibatch_mode_still_unimplemented(self) -> None:
+        """The within_minibatch mode is reserved but not implemented yet."""
+        with pytest.raises(NotImplementedError, match="within_minibatch"):
+            self._build_runner_with_grad_noise_cfg({"enabled": True, "mode": "within_minibatch"})
+
+    def test_explicit_ddp_native_requires_multi_gpu(self) -> None:
+        """mode='ddp_native' must error on single-GPU (b_big == b_small would div-by-zero)."""
+        with pytest.raises(ValueError, match="multi-GPU"):
             self._build_runner_with_grad_noise_cfg({"enabled": True, "mode": "ddp_native"})
+
+    def test_auto_resolves_to_across_minibatches_on_single_gpu(self) -> None:
+        """With no multi_gpu_cfg, mode='auto' resolves to across_minibatches."""
+        runner = self._build_runner_with_grad_noise_cfg({"enabled": True, "mode": "auto"})
+        assert runner.alg.noise_scale_tracker is not None
+        assert runner.alg.noise_scale_tracker.mode == "across_minibatches"
+
+    def test_auto_resolves_to_ddp_native_when_multi_gpu(self) -> None:
+        """With multi_gpu_cfg set, mode='auto' resolves to ddp_native."""
+        ppo, _ = _build_ppo(
+            gradient_noise_scale_cfg={"enabled": True, "mode": "auto"},
+            multi_gpu_cfg={"global_rank": 0, "local_rank": 0, "world_size": 2},
+        )
+        assert ppo.noise_scale_tracker is not None
+        assert ppo.noise_scale_tracker.mode == "ddp_native"
+        assert ppo.noise_scale_tracker.gpu_world_size == 2
 
     def test_unknown_cfg_key_raises(self) -> None:
         """Unrecognized cfg keys should be rejected so typos do not silently no-op."""
@@ -485,3 +511,77 @@ class TestGradientNoiseScaleIntegration:
                     )
                 else:
                     assert entry_val == other
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+        reason="ddp_native smoke test requires >= 2 CUDA devices",
+    )
+    def test_ddp_native_smoke_two_ranks(self) -> None:
+        """End-to-end DDP smoke: 2 NCCL ranks must produce a finite, rank-agreeing B_simple.
+
+        ``step_ddp_native`` all-reduces the local gradient norm, so after the call
+        every rank's EMA inputs are identical and therefore every rank's ``B_simple``
+        must be bit-equal up to the order of independent NCCL operations on the same
+        deterministic inputs.
+        """
+        ctx = mp.get_context("spawn")
+        result_queue: mp.Queue = ctx.Queue()
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = probe.getsockname()[1]
+
+        procs = [ctx.Process(target=_ddp_smoke_worker, args=(rank, 2, free_port, result_queue)) for rank in range(2)]
+        for proc in procs:
+            proc.start()
+        for proc in procs:
+            proc.join(timeout=180)
+            assert proc.exitcode == 0, f"DDP worker (pid={proc.pid}) exited with {proc.exitcode}"
+
+        per_rank: dict[int, dict[str, object]] = {}
+        for _ in range(2):
+            payload = result_queue.get(timeout=5)
+            per_rank[payload["rank"]] = payload
+        assert set(per_rank) == {0, 1}
+        for rank, payload in per_rank.items():
+            assert payload["mode"] == "ddp_native", f"rank {rank} mode={payload['mode']}"
+            # The unbiased estimators (G_sq, sigma_tr) can be transiently negative for the
+            # first few EMA samples — we only require finiteness here, not positivity.
+            assert math.isfinite(payload["B_simple"]), f"rank {rank} B_simple={payload['B_simple']}"
+            assert math.isfinite(payload["G_sq"]), f"rank {rank} G_sq={payload['G_sq']}"
+            assert math.isfinite(payload["sigma_tr"]), f"rank {rank} sigma_tr={payload['sigma_tr']}"
+        # The load-bearing invariant: step_ddp_native all-reduces its inputs, so every
+        # rank's EMA inputs are identical and the resulting state must agree across ranks.
+        assert per_rank[0]["B_simple"] == pytest.approx(per_rank[1]["B_simple"], rel=1e-5, abs=1e-12)
+        assert per_rank[0]["G_sq"] == pytest.approx(per_rank[1]["G_sq"], rel=1e-5, abs=1e-12)
+        assert per_rank[0]["sigma_tr"] == pytest.approx(per_rank[1]["sigma_tr"], rel=1e-5, abs=1e-12)
+
+
+def _ddp_smoke_worker(rank: int, world_size: int, port: int, result_queue: mp.Queue) -> None:
+    """One DDP rank: set up rendezvous env vars then let the runner handle init."""
+    try:
+        # OnPolicyRunner._configure_multi_gpu reads these env vars and calls
+        # ``torch.distributed.init_process_group`` itself; we must not double-init.
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(port)
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["LOCAL_RANK"] = str(rank)
+
+        device = f"cuda:{rank}"
+        env = DummyEnv(device=device)
+        cfg = _make_train_cfg("mlp")
+        cfg["algorithm"]["gradient_noise_scale_cfg"] = {"enabled": True, "mode": "auto"}
+        runner = OnPolicyRunner(env, cfg, log_dir=None, device=device)
+        runner.learn(num_learning_iterations=2)
+
+        state = runner.alg.noise_scale_tracker.state()
+        result_queue.put({
+            "rank": rank,
+            "mode": runner.alg.noise_scale_tracker.mode,
+            "B_simple": state["B_simple"],
+            "G_sq": state["G_sq"],
+            "sigma_tr": state["sigma_tr"],
+        })
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

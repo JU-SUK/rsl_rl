@@ -205,11 +205,9 @@ class PPO:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
-        # Gradient noise scale (across_minibatches): zero accumulators ahead of epoch 0
-        tracking_grad_noise = (
-            self.noise_scale_tracker is not None and self.noise_scale_tracker.mode == "across_minibatches"
-        )
-        if tracking_grad_noise:
+        # Gradient noise scale: per-mode setup
+        grad_noise_mode = self.noise_scale_tracker.mode if self.noise_scale_tracker is not None else None
+        if grad_noise_mode == "across_minibatches":
             self.noise_scale_tracker.begin_iteration()
         tracked_minibatch_size: int | None = None
 
@@ -310,14 +308,27 @@ class PPO:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
 
-            # Gradient noise scale (across_minibatches): read pre-reduce p.grad, epoch 0 only
-            if tracking_grad_noise and i < self.num_mini_batches:
+            # Gradient noise scale: pre-reduce hooks (read-only on p.grad)
+            local_grad_norm_sq: torch.Tensor | None = None
+            if grad_noise_mode == "across_minibatches" and i < self.num_mini_batches:
                 self.noise_scale_tracker.accumulate_minibatch(self._actor_critic_parameters())
                 tracked_minibatch_size = original_batch_size
+            elif grad_noise_mode == "ddp_native":
+                local_grad_norm_sq = self.noise_scale_tracker.grad_norm_sq(self._actor_critic_parameters())
 
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
+
+            # Gradient noise scale (ddp_native): step on the post-reduce gradient
+            if grad_noise_mode == "ddp_native":
+                global_grad_norm_sq = self.noise_scale_tracker.grad_norm_sq(self._actor_critic_parameters())
+                self.noise_scale_tracker.step_ddp_native(
+                    local_grad_norm_sq,
+                    global_grad_norm_sq,
+                    b_small=original_batch_size,
+                    b_big=original_batch_size * self.gpu_world_size,
+                )
 
             # Apply the gradients for PPO
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
@@ -339,7 +350,7 @@ class PPO:
                 mean_symmetry_loss += symmetry_loss.item()
 
         # Gradient noise scale (across_minibatches): finalize EMAs from epoch-0 accumulators
-        if tracking_grad_noise and tracked_minibatch_size is not None:
+        if grad_noise_mode == "across_minibatches" and tracked_minibatch_size is not None:
             self.noise_scale_tracker.step_across_minibatches(
                 b_small=tracked_minibatch_size, num_mini_batches=self.num_mini_batches
             )
@@ -515,8 +526,10 @@ class PPO:
         """Resolve the gradient-noise-scale config and return a tracker (or ``None`` if disabled).
 
         ``cfg=None`` and ``cfg={"enabled": False}`` both disable the metric; any other
-        cfg enables it. ``mode='auto'`` resolves to ``'across_minibatches'`` for now —
-        DDP-native auto-detection lands with that mode in a follow-up commit.
+        cfg enables it. ``mode='auto'`` picks ``'ddp_native'`` under multi-GPU and
+        ``'across_minibatches'`` otherwise. Explicit ``mode='ddp_native'`` is rejected
+        when not multi-GPU because the unbiased estimator would divide by zero
+        (``b_big == b_small`` when ``world_size == 1``).
         """
         if cfg is None:
             return None
@@ -525,11 +538,14 @@ class PPO:
             return None
         mode = cfg.pop("mode", "auto")
         if mode == "auto":
-            mode = "across_minibatches"
-        if mode != "across_minibatches":
-            raise NotImplementedError(
-                f"gradient noise scale mode={mode!r} is not implemented yet (only 'across_minibatches' is supported)."
+            mode = "ddp_native" if self.is_multi_gpu else "across_minibatches"
+        if mode == "ddp_native" and not self.is_multi_gpu:
+            raise ValueError(
+                "gradient noise scale mode='ddp_native' requires multi-GPU; "
+                "use mode='auto' or mode='across_minibatches' on a single GPU."
             )
+        if mode == "within_minibatch":
+            raise NotImplementedError(f"gradient noise scale mode={mode!r} is not implemented yet.")
         ema_decay = cfg.pop("ema_decay", 0.99)
         eps = cfg.pop("eps", 1e-12)
         cfg.pop("num_micro_shards", None)  # accepted for forward-compat with within_minibatch mode
