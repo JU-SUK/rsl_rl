@@ -88,6 +88,28 @@ class WandbSummaryWriter(SummaryWriter):
         )
         wandb.log({tag: scalar_value}, step=global_step)
 
+    def add_image(
+        self,
+        tag: str,
+        img_tensor,
+        global_step: int | None = None,
+        walltime: float | None = None,
+        dataformats: str = "CHW",
+    ) -> None:
+        """Log an image to both TensorBoard and W&B.
+
+        ``img_tensor`` is forwarded as-is to ``wandb.Image``, which handles numpy
+        ``HWC``/``HW`` arrays and torch tensors directly.
+        """
+        super().add_image(
+            tag,
+            img_tensor,
+            global_step=global_step,
+            walltime=walltime,
+            dataformats=dataformats,
+        )
+        wandb.log({tag: wandb.Image(img_tensor)}, step=global_step)
+
     def stop(self) -> None:
         """Finish the active W&B run."""
         wandb.finish()

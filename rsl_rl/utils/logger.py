@@ -44,6 +44,7 @@ class Logger:
 
         # Create buffers
         self.ep_extras = []
+        self.log_images_buffer: dict = {}
         self.rewbuffer = deque(maxlen=100)
         self.lenbuffer = deque(maxlen=100)
         self.cur_reward_sum = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
@@ -107,6 +108,11 @@ class Logger:
                 self.ep_extras.append(extras["episode"])
             elif "log" in extras:
                 self.ep_extras.append(extras["log"])
+
+            # Buffer per-iteration log images (e.g. curriculum heatmap). Latest emission per
+            # tag wins; the buffer is flushed and cleared in :meth:`log`.
+            if "log_images" in extras and extras["log_images"]:
+                self.log_images_buffer.update(extras["log_images"])
 
             # Update rewards and episode length
             if intrinsic_rewards is not None:
@@ -182,6 +188,11 @@ class Logger:
             for key, value in loss_dict.items():
                 self.writer.add_scalar(f"Loss/{key}", value, it)
             self.writer.add_scalar("Loss/learning_rate", learning_rate, it)
+
+            # Log buffered images (e.g. curriculum heatmap from extras["log_images"]).
+            for tag, img in self.log_images_buffer.items():
+                self.writer.add_image(tag, img, it, dataformats="HWC")
+            self.log_images_buffer.clear()
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
