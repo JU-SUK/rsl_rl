@@ -15,7 +15,13 @@ from rsl_rl.env import VecEnv
 from rsl_rl.extensions import RandomNetworkDistillation, Symmetry, resolve_rnd_config, resolve_symmetry_config
 from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
-from rsl_rl.utils import compile_model, resolve_callable, resolve_obs_groups, resolve_optimizer
+from rsl_rl.utils import (
+    GradientNoiseScaleTracker,
+    compile_model,
+    resolve_callable,
+    resolve_obs_groups,
+    resolve_optimizer,
+)
 
 
 class PPO:
@@ -57,6 +63,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Gradient noise scale parameters
+        gradient_noise_scale_cfg: dict | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -111,6 +119,9 @@ class PPO:
         self.schedule = schedule
         self.learning_rate = learning_rate
         self.normalize_advantage_per_mini_batch = normalize_advantage_per_mini_batch
+
+        # Gradient noise scale instrumentation (read-only metric; never writes p.grad)
+        self.noise_scale_tracker = self._build_noise_scale_tracker(gradient_noise_scale_cfg)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -194,6 +205,14 @@ class PPO:
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
 
+        # Gradient noise scale (across_minibatches): zero accumulators ahead of epoch 0
+        tracking_grad_noise = (
+            self.noise_scale_tracker is not None and self.noise_scale_tracker.mode == "across_minibatches"
+        )
+        if tracking_grad_noise:
+            self.noise_scale_tracker.begin_iteration()
+        tracked_minibatch_size: int | None = None
+
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -201,7 +220,7 @@ class PPO:
             generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Iterate over mini-batches
-        for batch in generator:
+        for i, batch in enumerate(generator):
             original_batch_size = batch.observations.batch_size[0]
 
             # Check if we should normalize advantages per mini-batch
@@ -291,6 +310,11 @@ class PPO:
                 self.rnd.optimizer.zero_grad()
                 rnd_loss.backward()
 
+            # Gradient noise scale (across_minibatches): read pre-reduce p.grad, epoch 0 only
+            if tracking_grad_noise and i < self.num_mini_batches:
+                self.noise_scale_tracker.accumulate_minibatch(self._actor_critic_parameters())
+                tracked_minibatch_size = original_batch_size
+
             # Collect gradients from all GPUs
             if self.is_multi_gpu:
                 self.reduce_parameters()
@@ -314,6 +338,12 @@ class PPO:
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
 
+        # Gradient noise scale (across_minibatches): finalize EMAs from epoch-0 accumulators
+        if tracking_grad_noise and tracked_minibatch_size is not None:
+            self.noise_scale_tracker.step_across_minibatches(
+                b_small=tracked_minibatch_size, num_mini_batches=self.num_mini_batches
+            )
+
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
@@ -334,6 +364,9 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.noise_scale_tracker is not None:
+            for key, value in self.noise_scale_tracker.state().items():
+                loss_dict[f"noise_scale/{key}"] = value
 
         # Clear the storage
         self.storage.clear()
@@ -477,3 +510,40 @@ class PPO:
                 param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
                 # Update the offset for the next parameter
                 offset += numel
+
+    def _build_noise_scale_tracker(self, cfg: dict | None) -> GradientNoiseScaleTracker | None:
+        """Resolve the gradient-noise-scale config and return a tracker (or ``None`` if disabled).
+
+        ``cfg=None`` and ``cfg={"enabled": False}`` both disable the metric; any other
+        cfg enables it. ``mode='auto'`` resolves to ``'across_minibatches'`` for now —
+        DDP-native auto-detection lands with that mode in a follow-up commit.
+        """
+        if cfg is None:
+            return None
+        cfg = dict(cfg)  # shallow copy so we don't mutate the caller's dict
+        if not cfg.pop("enabled", True):
+            return None
+        mode = cfg.pop("mode", "auto")
+        if mode == "auto":
+            mode = "across_minibatches"
+        if mode != "across_minibatches":
+            raise NotImplementedError(
+                f"gradient noise scale mode={mode!r} is not implemented yet (only 'across_minibatches' is supported)."
+            )
+        ema_decay = cfg.pop("ema_decay", 0.99)
+        eps = cfg.pop("eps", 1e-12)
+        cfg.pop("num_micro_shards", None)  # accepted for forward-compat with within_minibatch mode
+        if cfg:
+            raise ValueError(f"unrecognized keys in gradient_noise_scale_cfg: {sorted(cfg.keys())}")
+        return GradientNoiseScaleTracker(
+            mode=mode,
+            ema_decay=ema_decay,
+            is_multi_gpu=self.is_multi_gpu,
+            gpu_world_size=self.gpu_world_size,
+            device=self.device,
+            eps=eps,
+        )
+
+    def _actor_critic_parameters(self) -> list[torch.nn.Parameter]:
+        """Return actor + critic parameters (excluding RND) for the noise-scale tracker."""
+        return list(chain(self.actor.parameters(), self.critic.parameters()))

@@ -12,6 +12,8 @@ import tempfile
 import torch
 from tensordict import TensorDict
 
+import pytest
+
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 
@@ -381,3 +383,105 @@ class TestCNNRunner:
 
             for key, param in runner.alg.actor.state_dict().items():
                 assert torch.equal(saved_actor[key], param), f"CNN parameter '{key}' not restored after load"
+
+
+class TestGradientNoiseScaleIntegration:
+    """Tests for the gradient-noise-scale instrumentation in :class:`PPO`."""
+
+    @staticmethod
+    def _build_runner_with_grad_noise_cfg(grad_noise_cfg: dict | None) -> OnPolicyRunner:
+        """Build a fresh runner with ``cfg['algorithm']['gradient_noise_scale_cfg']`` set."""
+        env = DummyEnv()
+        cfg = _make_train_cfg("mlp")
+        if grad_noise_cfg is not None:
+            cfg["algorithm"]["gradient_noise_scale_cfg"] = grad_noise_cfg
+        return OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
+
+    @staticmethod
+    def _run_one_update(runner: OnPolicyRunner) -> dict[str, float]:
+        """Drive one rollout + PPO update and return the resulting loss_dict."""
+        runner.alg.train_mode()
+        obs = runner.env.get_observations()
+        for _ in range(8):  # matches num_steps_per_env in _make_train_cfg
+            actions = runner.alg.act(obs)
+            obs, rewards, dones, extras = runner.env.step(actions)
+            runner.alg.process_env_step(obs, rewards, dones, extras)
+        runner.alg.compute_returns(obs)
+        return runner.alg.update()
+
+    def test_metric_absent_when_cfg_is_none(self) -> None:
+        """No gradient_noise_scale_cfg ⇒ tracker is None and no noise_scale/* keys appear."""
+        runner = self._build_runner_with_grad_noise_cfg(None)
+        assert runner.alg.noise_scale_tracker is None
+        loss_dict = self._run_one_update(runner)
+        assert not any(key.startswith("noise_scale/") for key in loss_dict)
+
+    def test_metric_absent_when_disabled(self) -> None:
+        """enabled=False ⇒ tracker is None and no noise_scale/* keys appear."""
+        runner = self._build_runner_with_grad_noise_cfg({"enabled": False})
+        assert runner.alg.noise_scale_tracker is None
+        loss_dict = self._run_one_update(runner)
+        assert not any(key.startswith("noise_scale/") for key in loss_dict)
+
+    def test_metric_present_when_enabled(self) -> None:
+        """across_minibatches mode populates B_simple, G_sq, sigma_tr in loss_dict."""
+        runner = self._build_runner_with_grad_noise_cfg({"enabled": True, "mode": "across_minibatches"})
+        assert runner.alg.noise_scale_tracker is not None
+        loss_dict = self._run_one_update(runner)
+        assert "noise_scale/B_simple" in loss_dict
+        assert "noise_scale/G_sq" in loss_dict
+        assert "noise_scale/sigma_tr" in loss_dict
+        # After one update the denominator EMA must have moved off its initial zero.
+        assert loss_dict["noise_scale/G_sq"] != 0.0
+
+    def test_unimplemented_mode_raises(self) -> None:
+        """Requesting a mode that has not landed yet should raise NotImplementedError."""
+        with pytest.raises(NotImplementedError, match="ddp_native"):
+            self._build_runner_with_grad_noise_cfg({"enabled": True, "mode": "ddp_native"})
+
+    def test_unknown_cfg_key_raises(self) -> None:
+        """Unrecognized cfg keys should be rejected so typos do not silently no-op."""
+        with pytest.raises(ValueError, match="unrecognized"):
+            self._build_runner_with_grad_noise_cfg({"enabled": True, "typo_key": 0.5})
+
+    def test_bit_identical_disabled_vs_across_minibatches(self) -> None:
+        """Enabling the metric must not perturb the training trajectory.
+
+        Two seeded :meth:`learn` calls — one with the tracker off, one with
+        ``across_minibatches`` on — must produce byte-equal actor, critic, and
+        optimizer state. This is the load-bearing guarantee that the tracker
+        only reads ``p.grad`` and never writes to it.
+        """
+
+        def seeded_run(grad_noise_cfg: dict | None) -> dict[str, object]:
+            torch.manual_seed(42)
+            runner = self._build_runner_with_grad_noise_cfg(grad_noise_cfg)
+            runner.learn(num_learning_iterations=3)
+            return {
+                "actor": {k: v.clone() for k, v in runner.alg.actor.state_dict().items()},
+                "critic": {k: v.clone() for k, v in runner.alg.critic.state_dict().items()},
+                "optimizer": runner.alg.optimizer.state_dict(),
+            }
+
+        state_off = seeded_run(None)
+        state_on = seeded_run({"enabled": True, "mode": "across_minibatches"})
+
+        for component in ("actor", "critic"):
+            for key in state_off[component]:
+                assert torch.equal(state_off[component][key], state_on[component][key]), (
+                    f"{component} param '{key}' diverged when noise scale tracker is enabled"
+                )
+
+        # Adam optimizer state (exp_avg, exp_avg_sq, step).
+        optimizer_state_off = state_off["optimizer"]["state"]
+        optimizer_state_on = state_on["optimizer"]["state"]
+        assert optimizer_state_off.keys() == optimizer_state_on.keys()
+        for param_id in optimizer_state_off:
+            for entry_key, entry_val in optimizer_state_off[param_id].items():
+                other = optimizer_state_on[param_id][entry_key]
+                if isinstance(entry_val, torch.Tensor):
+                    assert torch.equal(entry_val, other), (
+                        f"optimizer state[{param_id}]['{entry_key}'] diverged when tracker is enabled"
+                    )
+                else:
+                    assert entry_val == other
