@@ -5,6 +5,7 @@
 
 """Helper functions."""
 
+from .gradient_noise_scale import GradientNoiseScaleTracker
 from .utils import (
     check_nan,
     compile_model,
@@ -18,6 +19,7 @@ from .utils import (
 )
 
 __all__ = [
+    "GradientNoiseScaleTracker",
     "check_nan",
     "compile_model",
     "get_param",
