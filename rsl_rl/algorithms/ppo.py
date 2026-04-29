@@ -211,6 +211,11 @@ class PPO:
             self.noise_scale_tracker.begin_iteration()
         tracked_minibatch_size: int | None = None
 
+        # Per-minibatch pre-clip gradient norms (actor, critic, combined). Always on; the
+        # mean tracks training-signal magnitude and the variance is one of M3's three
+        # supporting metrics (gradient-shaping fingerprint of shaped reward).
+        grad_norms: dict[str, list[torch.Tensor]] = {"actor": [], "critic": [], "combined": []}
+
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
             generator = self.storage.recurrent_mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
@@ -330,6 +335,15 @@ class PPO:
                     b_big=original_batch_size * self.gpu_world_size,
                 )
 
+            # Per-minibatch pre-clip gradient norms (read-only on p.grad). Stored as scalar
+            # tensors to avoid host-syncs every minibatch; aggregated to floats once after the loop.
+            with torch.no_grad():
+                actor_sq = self._grad_norm_sq(self.actor.parameters())
+                critic_sq = self._grad_norm_sq(self.critic.parameters())
+                grad_norms["actor"].append(actor_sq.sqrt())
+                grad_norms["critic"].append(critic_sq.sqrt())
+                grad_norms["combined"].append((actor_sq + critic_sq).sqrt())
+
             # Apply the gradients for PPO
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
@@ -378,6 +392,14 @@ class PPO:
         if self.noise_scale_tracker is not None:
             for key, value in self.noise_scale_tracker.state().items():
                 loss_dict[f"noise_scale/{key}"] = value
+
+        # Per-minibatch grad-norm mean/variance across the iteration's update steps
+        for component, values in grad_norms.items():
+            if not values:
+                continue
+            stacked = torch.stack(values)
+            loss_dict[f"grad_norm/{component}_mean"] = stacked.mean().item()
+            loss_dict[f"grad_norm/{component}_var"] = stacked.var(unbiased=False).item() if len(values) > 1 else 0.0
 
         # Clear the storage
         self.storage.clear()
@@ -563,3 +585,21 @@ class PPO:
     def _actor_critic_parameters(self) -> list[torch.nn.Parameter]:
         """Return actor + critic parameters (excluding RND) for the noise-scale tracker."""
         return list(chain(self.actor.parameters(), self.critic.parameters()))
+
+    @staticmethod
+    def _grad_norm_sq(params) -> torch.Tensor:
+        """Return ``sum_p |p.grad|^2`` as a scalar tensor on the gradient's device.
+
+        Skips parameters with ``p.grad is None``. Used by T-1's per-minibatch grad-norm
+        mean/variance logging; the gradient-noise-scale tracker keeps its own copy of this
+        helper to stay self-contained.
+        """
+        total: torch.Tensor | None = None
+        for p in params:
+            if p.grad is None:
+                continue
+            sq = p.grad.detach().pow(2).sum()
+            total = sq if total is None else total + sq
+        if total is None:
+            raise RuntimeError("no gradients found on the supplied parameters.")
+        return total
