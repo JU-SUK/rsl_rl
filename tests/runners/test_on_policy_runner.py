@@ -246,6 +246,122 @@ class TestSaveLoad:
             for key, param in runner2.alg.actor.state_dict().items():
                 assert torch.equal(saved_state[key], param), f"Normalization stat '{key}' not restored after load"
 
+    def test_curriculum_state_round_trips_through_save_load(self) -> None:
+        """runner.save embeds curriculum_state, runner.load calls manager.load_state_dict with it."""
+
+        class _FakeCurriculumManager:
+            def __init__(self) -> None:
+                self.tensor = torch.tensor([1.0, 2.0, 3.0])
+                self.last_loaded: dict | None = None
+
+            def state_dict(self) -> dict:
+                return {"my_term": {"x": self.tensor.clone()}}
+
+            def load_state_dict(self, state: dict) -> None:
+                self.last_loaded = state
+                self.tensor.copy_(state["my_term"]["x"])
+
+        env = DummyEnv()
+        env.curriculum_manager = _FakeCurriculumManager()
+        runner = OnPolicyRunner(env, _make_train_cfg("mlp"), log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_dict = torch.load(f.name, weights_only=False, map_location="cpu")
+            assert "curriculum_state" in saved_dict
+            assert torch.equal(saved_dict["curriculum_state"]["my_term"]["x"], torch.tensor([1.0, 2.0, 3.0]))
+
+            env2 = DummyEnv()
+            env2.curriculum_manager = _FakeCurriculumManager()
+            env2.curriculum_manager.tensor.copy_(torch.tensor([99.0, 99.0, 99.0]))
+            runner2 = OnPolicyRunner(env2, _make_train_cfg("mlp"), log_dir=None, device="cpu")
+            runner2.load(f.name)
+
+            assert env2.curriculum_manager.last_loaded is not None, "load_state_dict was never called"
+            assert torch.equal(env2.curriculum_manager.tensor, torch.tensor([1.0, 2.0, 3.0]))
+
+    def test_save_curriculum_state_false_omits_section(self) -> None:
+        """``save_curriculum_state=False`` should skip the curriculum_state key entirely."""
+
+        class _FakeCurriculumManager:
+            def state_dict(self) -> dict:
+                return {"my_term": {"x": torch.tensor([1.0])}}
+
+            def load_state_dict(self, state: dict) -> None:
+                pass
+
+        env = DummyEnv()
+        env.curriculum_manager = _FakeCurriculumManager()
+        cfg = _make_train_cfg("mlp")
+        cfg["save_curriculum_state"] = False
+        runner = OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_dict = torch.load(f.name, weights_only=False, map_location="cpu")
+            assert "curriculum_state" not in saved_dict
+
+    def test_reset_curriculum_on_load_skips_restore(self) -> None:
+        """``reset_curriculum_on_load=True`` should skip calling ``manager.load_state_dict``."""
+
+        class _FakeCurriculumManager:
+            def __init__(self) -> None:
+                self.tensor = torch.tensor([1.0])
+                self.load_calls = 0
+
+            def state_dict(self) -> dict:
+                return {"my_term": {"x": self.tensor.clone()}}
+
+            def load_state_dict(self, state: dict) -> None:
+                self.load_calls += 1
+
+        env = DummyEnv()
+        env.curriculum_manager = _FakeCurriculumManager()
+        runner = OnPolicyRunner(env, _make_train_cfg("mlp"), log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+
+            env2 = DummyEnv()
+            env2.curriculum_manager = _FakeCurriculumManager()
+            cfg2 = _make_train_cfg("mlp")
+            cfg2["reset_curriculum_on_load"] = True
+            runner2 = OnPolicyRunner(env2, cfg2, log_dir=None, device="cpu")
+            runner2.load(f.name)
+            assert env2.curriculum_manager.load_calls == 0, (
+                "reset_curriculum_on_load=True should skip the manager's load_state_dict"
+            )
+
+    def test_load_restores_optimizer_state(self) -> None:
+        """Loading should restore Adam optimizer state (step, exp_avg, exp_avg_sq)."""
+        runner = _build_runner()
+        runner.learn(num_learning_iterations=2)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved = copy.deepcopy(runner.alg.optimizer.state_dict()["state"])
+
+            runner.learn(num_learning_iterations=2)
+            current = runner.alg.optimizer.state_dict()["state"]
+            assert any(
+                isinstance(saved[pid][field], torch.Tensor)
+                and not torch.equal(saved[pid][field], current[pid][field])
+                for pid in saved
+                for field in ("exp_avg", "exp_avg_sq")
+            ), "Optimizer moments should change after additional training"
+
+            runner.load(f.name)
+            loaded = runner.alg.optimizer.state_dict()["state"]
+            for pid, fields in saved.items():
+                for name, val in fields.items():
+                    if isinstance(val, torch.Tensor):
+                        assert torch.equal(val, loaded[pid][name]), f"optimizer state[{pid}][{name}] not restored"
+                    else:
+                        assert val == loaded[pid][name], f"optimizer state[{pid}][{name}] not restored"
+
 
 class TestInferencePolicy:
     """Tests for get_inference_policy and the returned callable."""
