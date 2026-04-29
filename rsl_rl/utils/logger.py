@@ -146,6 +146,7 @@ class Logger:
         learning_rate: float,
         action_std: torch.Tensor,
         rnd_weight: float | None,
+        policy_metrics: dict[str, float] | None = None,
         print_minimal: bool = False,
         width: int = 80,
         pad: int = 40,
@@ -196,6 +197,13 @@ class Logger:
 
             # Log std
             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
+
+            # Per-terrain-type policy metrics (action magnitude, optionally entropy).
+            # Keys are pre-namespaced (e.g. ``per_task_action_magnitude/<name>``) and we
+            # add the ``Policy/`` group prefix here.
+            if policy_metrics:
+                for key, value in policy_metrics.items():
+                    self.writer.add_scalar(f"Policy/{key}", value, it)
 
             # Log performance
             fps = int(collection_size / (collect_time + learn_time))

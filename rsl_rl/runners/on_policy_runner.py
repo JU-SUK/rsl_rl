@@ -104,6 +104,12 @@ class OnPolicyRunner:
                 # Compute returns
                 self.alg.compute_returns(obs)
 
+                # Per-task policy metrics (action magnitude always; entropy only for
+                # heteroscedastic Gaussians since homoscedastic entropy is redundant with
+                # Loss/entropy). Computed before update() clears storage; graceful no-op
+                # on non-IsaacLab envs — see :meth:`_compute_per_task_policy_metrics`.
+                policy_metrics = self._compute_per_task_policy_metrics()
+
             # Update policy
             loss_dict = self.alg.update()
 
@@ -122,6 +128,7 @@ class OnPolicyRunner:
                 learning_rate=self.alg.learning_rate,
                 action_std=self.alg.get_policy().output_std,
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
+                policy_metrics=policy_metrics,
             )
 
             # Save model
@@ -165,6 +172,65 @@ class OnPolicyRunner:
         if not self.cfg.get("reset_curriculum_on_load", False) and "curriculum_state" in loaded_dict:
             self._set_curriculum_state(loaded_dict["curriculum_state"])
         return loaded_dict["infos"]
+
+    def _compute_per_task_policy_metrics(self) -> dict[str, float] | None:
+        """Per-terrain-type policy metrics over the just-collected rollout.
+
+        Returns a flat dict mapping ``<metric>/<terrain_name>`` → float. The logger
+        prefixes each key with ``Policy/``, so e.g.
+        ``per_task_action_magnitude/stepping_stone`` becomes
+        ``Policy/per_task_action_magnitude/stepping_stone`` in TB / W&B.
+
+        Always-logged:
+
+        - **Action magnitude.** ``mean(||a||_2)`` per terrain type. Depends on the action
+          *mean*, so it varies across envs even when ``std`` is global.
+
+        Conditionally-logged:
+
+        - **Action-distribution entropy.** Only for *heteroscedastic* Gaussians
+          (state-dependent ``std``). For homoscedastic Gaussians the per-task split is
+          degenerate (entropy depends only on ``std``, which is constant across envs),
+          and the same signal already lives in ``Loss/entropy`` — within ~0.003 nat,
+          which is just the std drift across the K minibatch update steps.
+
+        Returns ``None`` if the env is not an IsaacLab terrain env or storage hasn't
+        been populated yet — graceful no-op outside the locomotion-task setup.
+        """
+        try:
+            terrain = self.env.unwrapped.scene.terrain  # type: ignore[attr-defined]
+            terrain_types = terrain.terrain_types  # [num_envs] long
+            sub_terrain_names = list(terrain.cfg.terrain_generator.sub_terrains.keys())
+        except (AttributeError, KeyError):
+            return None
+
+        actions = self.alg.storage.actions
+        if actions is None:
+            return None
+
+        metrics: dict[str, float] = {}
+
+        # Per-task action magnitude. ``actions`` is [num_steps, num_envs, action_dim].
+        action_magnitudes = actions.norm(dim=-1)  # [num_steps, num_envs]
+        for terrain_index, name in enumerate(sub_terrain_names):
+            mask = terrain_types == terrain_index
+            if mask.any():
+                metrics[f"per_task_action_magnitude/{name}"] = action_magnitudes[:, mask].mean().item()
+
+        # Per-task entropy — only worth logging if std varies across envs (heteroscedastic).
+        params = self.alg.storage.distribution_params
+        if params is not None and len(params) == 2:
+            mean, std = params
+            if mean.ndim == 3 and std.shape == mean.shape:
+                std_varies_across_envs = std.std(dim=1).max().item() > 1e-9
+                if std_varies_across_envs:
+                    entropy_per_step_env = (0.5 * (2.0 * torch.pi * torch.e * std.pow(2)).log()).sum(dim=-1)
+                    for terrain_index, name in enumerate(sub_terrain_names):
+                        mask = terrain_types == terrain_index
+                        if mask.any():
+                            metrics[f"per_task_entropy/{name}"] = entropy_per_step_env[:, mask].mean().item()
+
+        return metrics if metrics else None
 
     def _get_curriculum_state(self) -> dict | None:
         """Return the curriculum manager's serializable state, or ``None`` if unavailable."""
