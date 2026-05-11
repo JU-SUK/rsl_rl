@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import time
 import torch
+from datetime import timedelta
 
 from rsl_rl.algorithms import PPO
 from rsl_rl.env import VecEnv
@@ -332,6 +333,11 @@ class OnPolicyRunner:
             )
 
         # Initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        torch.distributed.init_process_group(
+            backend="nccl",
+            rank=self.gpu_global_rank,
+            world_size=self.gpu_world_size,
+            timeout=timedelta(minutes=10),
+        )
         # Set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
