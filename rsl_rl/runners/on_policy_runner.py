@@ -79,6 +79,12 @@ class OnPolicyRunner:
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
+            # Resample gSDE exploration weights once per rollout so the
+            # state-dependent noise direction is consistent within the rollout
+            # but refreshed between iterations. No-op for non-gSDE distributions.
+            actor_dist = getattr(getattr(self.alg, "actor", None), "distribution", None)
+            if actor_dist is not None and hasattr(actor_dist, "sample_weights"):
+                actor_dist.sample_weights()
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):

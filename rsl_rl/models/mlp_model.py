@@ -97,8 +97,20 @@ class MLPModel(nn.Module):
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
         # Get MLP input latent
         latent = self.get_latent(obs, masks, hidden_state)
-        # MLP forward pass
-        mlp_output = self.mlp(latent)
+        # If the distribution is gSDE, we need the penultimate-layer activations
+        # ("features"). Iterate children manually instead of slicing
+        # ``self.mlp[:-1]`` — ``MLP`` is an ``nn.Sequential`` subclass whose
+        # ``__init__`` requires positional args, so ``Sequential.__getitem__``
+        # with a slice tries to rebuild the wrong class.
+        if self.distribution is not None and hasattr(self.distribution, "set_features"):
+            children = list(self.mlp.children())
+            features = latent
+            for layer in children[:-1]:
+                features = layer(features)
+            mlp_output = children[-1](features)
+            self.distribution.set_features(features)
+        else:
+            mlp_output = self.mlp(latent)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:

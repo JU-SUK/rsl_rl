@@ -325,6 +325,168 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
             torch.nn.init.constant_(mlp[-2].bias[self.output_dim :], init_std_log)  # type: ignore
 
 
+class GsdeDistribution(GaussianDistribution):
+    """Generalized State-Dependent Exploration (gSDE) Gaussian distribution.
+
+    The exploration noise is correlated across time within a rollout because it
+    is a deterministic linear function of the policy's penultimate features and
+    a sampled weight matrix that is held fixed for many consecutive steps.
+
+    Per Raffin et al., "Smooth Exploration for Robotic Reinforcement Learning"
+    (https://arxiv.org/abs/2005.05719):
+
+    * ``log_std`` is a 2-D learnable parameter of shape
+      ``(latent_dim, output_dim)`` (vs. 1-D for the homoscedastic Gaussian).
+    * Per-action stddev is ``sqrt(phi(s)**2 @ exp(log_std)**2 + eps)`` where
+      ``phi(s)`` are the features from the last hidden layer of the policy MLP.
+    * Sampled action is ``mean + phi(s) @ W``, with the weight matrix
+      ``W ~ N(0, exp(log_std)**2)`` resampled periodically (typically once per
+      rollout) via :meth:`sample_weights`. Between resamples the noise is a
+      smooth state-dependent function — exactly the gSDE property.
+
+    Use with :class:`rsl_rl.models.MLPModel` (or any subclass) which now
+    automatically calls :meth:`set_features` with the penultimate-layer
+    activations before :meth:`update`. The model also invokes
+    :meth:`init_mlp_weights` to lazily allocate ``log_std`` once the MLP's
+    latent dim is known.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        init_std: float = 1.0,
+        std_range: tuple[float, float] = (1e-6, 1e6),
+        epsilon: float = 1e-6,
+        learn_std: bool = True,
+    ) -> None:
+        """Initialize the gSDE distribution module.
+
+        Args:
+            output_dim: Action / output dimension.
+            init_std: Initial scalar standard deviation; broadcasted to all entries of ``log_std``.
+            std_range: ``(min, max)`` clamp range applied to the exp-of-log std.
+            epsilon: Numerical stabilization added inside the sqrt for variance.
+            learn_std: Whether ``log_std`` is learnable. ``False`` fixes it to ``log(init_std)``.
+        """
+        # Sidestep GaussianDistribution.__init__ — it allocates a 1-D
+        # log_std_param we don't use. Replicate the bits we need.
+        Distribution.__init__(self, output_dim)
+        self.std_type = "gsde"
+        self.epsilon = epsilon
+        self._init_std = float(init_std)
+        self._learn_std = bool(learn_std)
+        self.std_range = list(std_range)
+        self.std_range[0] = max(self.std_range[0], 1e-6)
+        self.log_std_range = [float(np.log(self.std_range[0])), float(np.log(self.std_range[1]))]
+
+        # Lazily allocated: needs latent_dim from MLPModel.init_mlp_weights().
+        self.log_std_param: nn.Parameter | None = None
+        # Buffer storing the resampled exploration weight matrix; shape
+        # ``(latent_dim, output_dim)``. Lazily allocated alongside log_std.
+        self.register_buffer("_exploration_matrix", torch.zeros(0))
+        # Features cache: set by MLPModel.forward() before each update().
+        self._cached_features: torch.Tensor | None = None
+        # Distribution populated by update(); used for log_prob / kl_divergence.
+        self._distribution: Normal | None = None
+
+        Normal.set_default_validate_args(False)
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Allocate the 2-D ``log_std`` parameter once the MLP is built.
+
+        Infers ``latent_dim`` from the penultimate ``nn.Linear`` layer's output
+        dimension (the layer feeding the final output linear of the MLP).
+        """
+        if self.log_std_param is not None:
+            return
+        latent_dim = None
+        # Iterate from the end: first Linear is the output head; second Linear
+        # we hit is the last hidden layer whose ``out_features`` is the
+        # latent_dim that gets passed as features to this distribution.
+        seen_output = False
+        for module in reversed(list(mlp.modules())):
+            if isinstance(module, nn.Linear):
+                if not seen_output:
+                    seen_output = True
+                    continue
+                latent_dim = module.out_features
+                break
+        if latent_dim is None:
+            raise RuntimeError(
+                "gSDE: could not infer latent_dim from the MLP. The MLP must contain at"
+                " least two ``nn.Linear`` layers (a hidden layer + an output layer)."
+            )
+        device = next(mlp.parameters()).device if any(True for _ in mlp.parameters()) else torch.device("cpu")
+        log_init = float(np.log(self._init_std + 1e-7))
+        self.log_std_param = nn.Parameter(
+            log_init * torch.ones(latent_dim, self.output_dim, device=device),
+            requires_grad=self._learn_std,
+        )
+        self._exploration_matrix = torch.zeros(latent_dim, self.output_dim, device=device)
+        self.sample_weights()
+
+    @property
+    def latent_dim(self) -> int:
+        if self.log_std_param is None:
+            raise RuntimeError("gSDE: latent_dim is undefined until init_mlp_weights() runs.")
+        return self.log_std_param.shape[0]
+
+    def sample_weights(self) -> None:
+        """Resample the exploration weight matrix from ``N(0, std**2)``.
+
+        Call once per rollout (or every K steps) to refresh the correlated
+        noise direction. Between resamples, the noise applied to every
+        action is a smooth function of the latent features.
+        """
+        if self.log_std_param is None:
+            return
+        log_std = self.log_std_param.detach().clamp(self.log_std_range[0], self.log_std_range[1])
+        std = torch.exp(log_std)
+        self._exploration_matrix = std * torch.randn_like(std)
+
+    def set_features(self, features: torch.Tensor) -> None:
+        """Cache the penultimate-layer features for the next :meth:`update` and :meth:`sample`."""
+        self._cached_features = features
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Build a per-batch Gaussian with state-dependent stddev.
+
+        Stddev for action ``i`` in batch entry ``b`` is
+        ``sqrt(sum_j features[b, j]^2 * exp(log_std[j, i])^2 + epsilon)``.
+        """
+        if self.log_std_param is None:
+            raise RuntimeError(
+                "GsdeDistribution.update called before init_mlp_weights(). MLPModel should"
+                " trigger this automatically once the actor is constructed."
+            )
+        if self._cached_features is None:
+            raise RuntimeError(
+                "GsdeDistribution.update called before set_features(). The wrapping model"
+                " must call set_features() with the penultimate-layer activations."
+            )
+        log_std = self.log_std_param.clamp(self.log_std_range[0], self.log_std_range[1])
+        std_2d = torch.exp(log_std)
+        variance = self._cached_features.pow(2) @ std_2d.pow(2)
+        stddev = torch.sqrt(variance + self.epsilon)
+        self._distribution = Normal(mlp_output, stddev)
+
+    def sample(self) -> torch.Tensor:
+        """Sample an action by adding state-dependent correlated noise to the mean.
+
+        Noise is ``features @ exploration_matrix``; deterministic given the
+        current features and the most recently sampled weight matrix.
+        """
+        if self._cached_features is None or self._exploration_matrix.numel() == 0:
+            raise RuntimeError("GsdeDistribution.sample called before update().")
+        noise = self._cached_features @ self._exploration_matrix.to(self._cached_features.device)
+        assert self._distribution is not None
+        return self._distribution.mean + noise
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        return (self.mean, self.std)
+
+
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 
