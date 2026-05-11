@@ -356,6 +356,7 @@ class GsdeDistribution(GaussianDistribution):
         output_dim: int,
         init_std: float = 1.0,
         std_range: tuple[float, float] = (1e-6, 1e6),
+        std_type: str = "log",
         epsilon: float = 1e-6,
         learn_std: bool = True,
     ) -> None:
@@ -365,9 +366,14 @@ class GsdeDistribution(GaussianDistribution):
             output_dim: Action / output dimension.
             init_std: Initial scalar standard deviation; broadcasted to all entries of ``log_std``.
             std_range: ``(min, max)`` clamp range applied to the exp-of-log std.
+            std_type: Accepted for compatibility with :class:`GaussianDistribution` 's cfg
+                serialization; gSDE always parameterizes the std in log-space internally,
+                so this argument is ignored apart from a value check.
             epsilon: Numerical stabilization added inside the sqrt for variance.
             learn_std: Whether ``log_std`` is learnable. ``False`` fixes it to ``log(init_std)``.
         """
+        if std_type not in ("log", "scalar"):
+            raise ValueError(f"GsdeDistribution: unknown std_type={std_type!r}; expected 'log' or 'scalar'.")
         # Sidestep GaussianDistribution.__init__ — it allocates a 1-D
         # log_std_param we don't use. Replicate the bits we need.
         Distribution.__init__(self, output_dim)
