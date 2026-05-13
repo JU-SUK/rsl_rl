@@ -6,9 +6,15 @@
 """Tests for distribution modules."""
 
 import math
+import numpy as np
 import torch
 
-from rsl_rl.modules.distribution import GaussianDistribution, HeteroscedasticGaussianDistribution
+from rsl_rl.modules import MLP
+from rsl_rl.modules.distribution import (
+    GaussianDistribution,
+    GSDEGaussianDistribution,
+    HeteroscedasticGaussianDistribution,
+)
 
 
 class TestGaussianDistribution:
@@ -249,3 +255,229 @@ class TestHeteroscedasticGaussianDistribution:
         """The minimum of std_range should be floored to 1e-6 for numerical stability."""
         dist = HeteroscedasticGaussianDistribution(output_dim=2, init_std=1.0, std_type="scalar", std_range=(0.0, 10.0))
         assert dist.std_range[0] == 1e-6
+
+
+def _build_gsde(
+    output_dim: int = 3,
+    input_dim: int = 6,
+    hidden_dims: tuple[int, ...] = (8, 8),
+    **gsde_kwargs: object,
+) -> tuple[GSDEGaussianDistribution, MLP]:
+    """Build an ``MLP`` paired with an initialised ``GSDEGaussianDistribution``."""
+    dist = GSDEGaussianDistribution(output_dim=output_dim, **gsde_kwargs)
+    mlp = MLP(input_dim, output_dim, hidden_dims=hidden_dims)
+    dist.init_mlp_weights(mlp)
+    return dist, mlp
+
+
+def _forward_with_latent(mlp: MLP, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run ``mlp`` and return ``(mean, latent_sde)`` via :meth:`MLP.forward_with_features`."""
+    return mlp.forward_with_features(x)
+
+
+class TestGSDEGaussianDistribution:
+    """Tests for ``GSDEGaussianDistribution``."""
+
+    def test_requires_latent_sde(self) -> None:
+        """The class must flag itself as needing the penultimate MLP activation."""
+        dist = GSDEGaussianDistribution(output_dim=3)
+        assert dist.requires_latent_sde is True
+
+    def test_input_dim_is_action_dim(self) -> None:
+        """MLP outputs only the mean; std is owned by the distribution."""
+        dim = 5
+        dist = GSDEGaussianDistribution(output_dim=dim)
+        assert dist.input_dim == dim
+
+    def test_log_std_shape_full_std(self) -> None:
+        """With full_std=True, log_std_param has shape [latent_sde_dim, output_dim]."""
+        dist, _ = _build_gsde(output_dim=3, hidden_dims=(16, 12), full_std=True)
+        assert dist.latent_sde_dim == 12
+        assert dist.log_std_param.shape == (12, 3)
+
+    def test_log_std_shape_reduced(self) -> None:
+        """With full_std=False, log_std_param has shape [latent_sde_dim, 1]."""
+        dist, _ = _build_gsde(output_dim=3, hidden_dims=(16, 12), full_std=False)
+        assert dist.log_std_param.shape == (12, 1)
+
+    def test_marginal_variance_matches_quadratic_formula(self) -> None:
+        """The marginal std must equal sqrt(phi^2 @ sigma^2 + epsilon) exactly."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8), init_std=0.4, full_std=True)
+        dist.sample_weights(batch_size=4)
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        dist.update(mean, latent_sde=latent_sde)
+
+        sigma = torch.exp(dist.log_std_param)
+        expected_variance = torch.mm(latent_sde**2, sigma**2)
+        expected_std = torch.sqrt(expected_variance + dist.epsilon)
+        assert torch.allclose(dist.std, expected_std, atol=1e-6)
+
+    def test_temporal_correlation_property(self) -> None:
+        """Two sample() calls with the same state and no re-sample_weights give identical actions.
+
+        This is the core property gSDE provides and that ``main``'s implementation lacks.
+        """
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        dist.sample_weights(batch_size=4)
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        dist.update(mean, latent_sde=latent_sde)
+        a1 = dist.sample()
+        a2 = dist.sample()
+        assert torch.equal(a1, a2), "gSDE must return identical actions for identical state with fixed epsilon"
+
+    def test_resample_weights_changes_noise(self) -> None:
+        """After sample_weights(), a new epsilon is drawn and the noise changes."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        dist.sample_weights(batch_size=4)
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        dist.update(mean, latent_sde=latent_sde)
+        a_before = dist.sample()
+
+        dist.sample_weights(batch_size=4)
+        dist.update(mean, latent_sde=latent_sde)
+        a_after = dist.sample()
+        assert not torch.equal(a_before, a_after)
+
+    def test_per_env_epsilon_independence(self) -> None:
+        """Per-env epsilon yields different noise across envs even with identical features."""
+        torch.manual_seed(0)
+        dist, _ = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        n_envs = 5
+        dist.sample_weights(batch_size=n_envs)
+
+        # Identical latent across envs — any difference in noise must come from per-env epsilon.
+        same_latent = torch.randn(1, dist.latent_sde_dim).expand(n_envs, dist.latent_sde_dim).contiguous()
+        same_mean = torch.zeros(n_envs, 3)
+        dist.update(same_mean, latent_sde=same_latent)
+        actions = dist.sample()
+        # No two rows should be identical: per-env epsilon differs for each row.
+        for i in range(n_envs):
+            for j in range(i + 1, n_envs):
+                assert not torch.equal(actions[i], actions[j])
+
+    def test_sample_without_sample_weights_raises(self) -> None:
+        """sample() before sample_weights() must raise — runner is responsible for the reset."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        dist.update(mean, latent_sde=latent_sde)
+        try:
+            dist.sample()
+        except RuntimeError:
+            return
+        raise AssertionError("sample() should have raised RuntimeError because epsilon was never sampled.")
+
+    def test_learn_features_false_blocks_feature_gradient(self) -> None:
+        """With learn_features=False the variance term is detached from the feature backbone."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8), learn_features=False)
+        dist.sample_weights(batch_size=4)
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        latent_sde_leaf = latent_sde.detach().clone().requires_grad_(True)
+        dist.update(mean.detach(), latent_sde=latent_sde_leaf)
+
+        # Loss depending only on the marginal std (so any gradient on latent_sde_leaf would come
+        # exclusively from the variance term, which is detached when learn_features=False).
+        dist.std.sum().backward()
+        assert latent_sde_leaf.grad is None or torch.all(latent_sde_leaf.grad == 0)
+
+    def test_learn_features_true_allows_feature_gradient(self) -> None:
+        """With learn_features=True, the variance backprops into the features."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8), learn_features=True)
+        dist.sample_weights(batch_size=4)
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        latent_sde_leaf = latent_sde.detach().clone().requires_grad_(True)
+        dist.update(mean.detach(), latent_sde=latent_sde_leaf)
+
+        dist.std.sum().backward()
+        assert latent_sde_leaf.grad is not None and not torch.all(latent_sde_leaf.grad == 0)
+
+    def test_kl_divergence_identical_is_zero(self) -> None:
+        """KL(p || p) under the marginal Gaussian should be zero."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=4, hidden_dims=(8, 8))
+        dist.sample_weights(batch_size=2)
+
+        x = torch.randn(2, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        dist.update(mean, latent_sde=latent_sde)
+        kl = dist.kl_divergence(dist.params, dist.params)
+        assert torch.allclose(kl, torch.zeros_like(kl), atol=1e-6)
+
+    def test_log_std_param_gets_gradient(self) -> None:
+        """log_prob must backprop into log_std_param so PPO can learn the variance."""
+        torch.manual_seed(0)
+        dist, mlp = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        dist.sample_weights(batch_size=4)
+
+        x = torch.randn(4, 6)
+        mean, latent_sde = _forward_with_latent(mlp, x)
+        dist.update(mean, latent_sde=latent_sde)
+
+        # Evaluate log_prob at a fixed off-mean point (PPO uses the stored action, not a fresh sample,
+        # so the reparam-trick cancellation does not apply).
+        log_p = dist.log_prob(torch.zeros(4, 3))
+        log_p.sum().backward()
+        assert dist.log_std_param.grad is not None
+        assert not torch.all(dist.log_std_param.grad == 0)
+
+    def test_std_range_clamping(self) -> None:
+        """The implied scalar std should be clamped to std_range."""
+        dist, _ = _build_gsde(output_dim=2, hidden_dims=(4, 4), init_std=0.5, std_range=(0.1, 0.4))
+        # Force the param outside the upper bound — the clamp should bring std down to 0.4.
+        with torch.no_grad():
+            dist.log_std_param.fill_(float(np.log(10.0)))
+        std = dist._get_std()
+        assert torch.allclose(std, torch.full_like(std, 0.4), atol=1e-6)
+        # And below the lower bound — clamp brings it up to 0.1.
+        with torch.no_grad():
+            dist.log_std_param.fill_(float(np.log(1e-9)))
+        std = dist._get_std()
+        assert torch.allclose(std, torch.full_like(std, 0.1), atol=1e-6)
+
+    def test_use_expln_yields_different_std(self) -> None:
+        """use_expln=True must give a different std curve than plain exp for positive log_std."""
+        torch.manual_seed(0)
+        dist_exp, _ = _build_gsde(output_dim=3, hidden_dims=(8,), use_expln=False)
+        dist_expln, _ = _build_gsde(output_dim=3, hidden_dims=(8,), use_expln=True)
+        # Make log_std positive so the two branches diverge.
+        with torch.no_grad():
+            dist_exp.log_std_param.fill_(1.5)
+            dist_expln.log_std_param.fill_(1.5)
+        assert not torch.allclose(dist_exp._get_std(), dist_expln._get_std())
+
+    def test_exploration_matrix_not_persisted(self) -> None:
+        """The exploration tensor must not be serialized in state_dict; it is transient by design."""
+        dist, _ = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        dist.sample_weights(batch_size=4)
+        state = dist.state_dict()
+        assert dist.exploration_matrix is not None  # actually drawn...
+        # ...but not under the canonical names in state_dict.
+        for key in state:
+            assert "exploration_matrix" not in key
+            assert "exploration_matrices" not in key
+
+    def test_log_std_persists_through_state_dict_roundtrip(self) -> None:
+        """log_std_param must round-trip cleanly through state_dict save/load."""
+        dist_a, _ = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        dist_b, _ = _build_gsde(output_dim=3, hidden_dims=(8, 8))
+        with torch.no_grad():
+            dist_a.log_std_param.copy_(torch.randn_like(dist_a.log_std_param))
+        dist_b.load_state_dict(dist_a.state_dict())
+        assert torch.equal(dist_a.log_std_param, dist_b.log_std_param)

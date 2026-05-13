@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from collections.abc import Iterable
 from itertools import chain
 from tensordict import TensorDict
 
@@ -65,6 +66,9 @@ class PPO:
         multi_gpu_cfg: dict | None = None,
         # Gradient noise scale parameters
         gradient_noise_scale_cfg: dict | None = None,
+        # gSDE: re-sample the exploration matrix every N env steps within a rollout.
+        # ``-1`` (default) resamples only once, at the start of each rollout.
+        sde_sample_freq: int = -1,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -122,6 +126,26 @@ class PPO:
 
         # Gradient noise scale instrumentation (read-only metric; never writes p.grad)
         self.noise_scale_tracker = self._build_noise_scale_tracker(gradient_noise_scale_cfg)
+
+        # gSDE: cache the exploration-matrix re-sampling frequency. Resolved against the
+        # actor's distribution lazily inside ``reset_sde_noise`` so the algorithm stays
+        # gSDE-agnostic when a non-gSDE distribution is used.
+        self.sde_sample_freq = sde_sample_freq
+
+    def reset_sde_noise(self, num_envs: int) -> None:
+        """Resample the gSDE exploration matrix for ``num_envs`` parallel envs.
+
+        No-op when the actor's distribution does not require state-dependent exploration.
+        Called by the runner at the start of every rollout and, when
+        :attr:`sde_sample_freq` is positive, every ``sde_sample_freq`` env-steps.
+
+        Args:
+            num_envs: Number of parallel environments — used as the batch size when
+                drawing per-env exploration matrices.
+        """
+        dist = getattr(self._raw_actor, "distribution", None)
+        if dist is not None and getattr(dist, "requires_latent_sde", False):
+            dist.sample_weights(batch_size=num_envs)
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         """Sample actions and store transition data."""
@@ -587,7 +611,7 @@ class PPO:
         return list(chain(self.actor.parameters(), self.critic.parameters()))
 
     @staticmethod
-    def _grad_norm_sq(params) -> torch.Tensor:
+    def _grad_norm_sq(params: Iterable[nn.Parameter]) -> torch.Tensor:
         """Return ``sum_p |p.grad|^2`` as a scalar tensor on the gradient's device.
 
         Skips parameters with ``p.grad is None``. Used by T-1's per-minibatch grad-norm

@@ -97,12 +97,19 @@ class MLPModel(nn.Module):
         obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
         # Get MLP input latent
         latent = self.get_latent(obs, masks, hidden_state)
-        # MLP forward pass
-        mlp_output = self.mlp(latent)
+        # MLP forward pass — capture the penultimate activation too if the distribution needs it (gSDE).
+        latent_sde: torch.Tensor | None = None
+        if self.distribution is not None and self.distribution.requires_latent_sde:
+            mlp_output, latent_sde = self.mlp.forward_with_features(latent)
+        else:
+            mlp_output = self.mlp(latent)
         # If stochastic output is requested, update the distribution and sample from it, otherwise return MLP output
         if self.distribution is not None:
             if stochastic_output:
-                self.distribution.update(mlp_output)
+                if latent_sde is not None:
+                    self.distribution.update(mlp_output, latent_sde=latent_sde)
+                else:
+                    self.distribution.update(mlp_output)
                 return self.distribution.sample()
             return self.distribution.deterministic_output(mlp_output)
         return mlp_output

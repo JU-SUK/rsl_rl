@@ -81,7 +81,12 @@ class OnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.cfg["num_steps_per_env"]):
+                # gSDE: re-sample the exploration matrix at the start of every rollout. No-op for non-gSDE actors.
+                self.alg.reset_sde_noise(self.env.num_envs)
+                for step in range(self.cfg["num_steps_per_env"]):
+                    # gSDE: re-sample the exploration matrix every sde_sample_freq env-steps within the rollout.
+                    if self.alg.sde_sample_freq > 0 and step > 0 and step % self.alg.sde_sample_freq == 0:
+                        self.alg.reset_sde_noise(self.env.num_envs)
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
