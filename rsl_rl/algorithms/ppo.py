@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from collections.abc import Iterable
 from itertools import chain
 from tensordict import TensorDict
 
@@ -610,7 +611,7 @@ class PPO:
         return list(chain(self.actor.parameters(), self.critic.parameters()))
 
     @staticmethod
-    def _grad_norm_sq(params) -> torch.Tensor:
+    def _grad_norm_sq(params: Iterable[nn.Parameter]) -> torch.Tensor:
         """Return ``sum_p |p.grad|^2`` as a scalar tensor on the gradient's device.
 
         Skips parameters with ``p.grad is None``. Used by T-1's per-minibatch grad-norm
