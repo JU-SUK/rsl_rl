@@ -93,3 +93,28 @@ class MLP(nn.Sequential):
         for layer in self:
             x = layer(x)
         return x
+
+    def forward_with_features(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass that also returns the activation input to the last :class:`torch.nn.Linear`.
+
+        The captured activation is the same tensor that is consumed by the last linear projection.
+        It is suitable as the ``latent_sde`` input for :class:`~rsl_rl.modules.GSDEGaussianDistribution`.
+
+        Returns:
+            A tuple of ``(output, features)``. ``output`` is the standard MLP output;
+            ``features`` is the activation passed into the last linear layer.
+        """
+        last_linear_idx = -1
+        for i, layer in enumerate(self):
+            if isinstance(layer, nn.Linear):
+                last_linear_idx = i
+        if last_linear_idx < 0:
+            raise RuntimeError("MLP.forward_with_features requires at least one nn.Linear layer in the MLP.")
+
+        features: torch.Tensor | None = None
+        for i, layer in enumerate(self):
+            if i == last_linear_idx:
+                features = x
+            x = layer(x)
+        assert features is not None  # last_linear_idx is in range, so this branch ran
+        return x, features
