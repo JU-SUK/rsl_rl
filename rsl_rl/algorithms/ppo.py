@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 from collections.abc import Iterable
 from itertools import chain
+from typing import Literal
+
 from tensordict import TensorDict
 
 from rsl_rl.env import VecEnv
@@ -52,6 +54,7 @@ class PPO:
         entropy_coef: float = 0.01,
         learning_rate: float = 0.001,
         max_grad_norm: float = 1.0,
+        grad_norm_clip_mode: Literal["separate", "unified"] = "separate",
         optimizer: str = "adam",
         use_clipped_value_loss: bool = True,
         schedule: str = "adaptive",
@@ -118,6 +121,7 @@ class PPO:
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
+        self.grad_norm_clip_mode = grad_norm_clip_mode
         self.use_clipped_value_loss = use_clipped_value_loss
         self.desired_kl = desired_kl
         self.schedule = schedule
@@ -369,8 +373,13 @@ class PPO:
                 grad_norms["combined"].append((actor_sq + critic_sq).sqrt())
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            if self.grad_norm_clip_mode == "unified":
+                nn.utils.clip_grad_norm_(
+                    chain(self.actor.parameters(), self.critic.parameters()), self.max_grad_norm
+                )
+            else:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
             if self.rnd:
