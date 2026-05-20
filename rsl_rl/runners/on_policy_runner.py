@@ -298,6 +298,10 @@ class OnPolicyRunner:
         """Register a repository path whose git status should be logged."""
         self.logger.git_status_repos.append(repo_file_path)
 
+    def add_file_to_log(self, file_path: str) -> None:
+        """Register a file path to upload to W&B/Neptune when the writer initializes."""
+        self.logger.log_files.append(file_path)
+
     def _configure_multi_gpu(self) -> None:
         """Configure multi-gpu training."""
         # Check if distributed training is enabled

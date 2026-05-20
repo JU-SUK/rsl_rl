@@ -39,6 +39,7 @@ class Logger:
         self.gpu_world_size = gpu_world_size
         self.device = device
         self.git_status_repos = [rsl_rl.__file__]
+        self.log_files: list[str] = []
         self.tot_timesteps = 0
         self.tot_time = 0
 
@@ -88,6 +89,11 @@ class Logger:
 
         # Save code state
         files_to_upload = self._store_code_state()
+
+        # Include any externally registered files (e.g., run manifest, config dumps).
+        for path in self.log_files:
+            if os.path.isfile(path):
+                files_to_upload.append(path)
 
         # Upload configuration and code state to external logging service if applicable
         if self.writer is not None and self.logger_type in ["wandb", "neptune"]:
