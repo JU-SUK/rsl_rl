@@ -131,7 +131,8 @@ class WandbSummaryWriter(SummaryWriter):
         """
         if not paths:
             return
-        art = wandb.Artifact(name="run-config", type="run-config")
+        # Suffix with run.id so each run owns its own :v0 artifact.
+        art = wandb.Artifact(name=f"run-config-{wandb.run.id}", type="run-config")
         names_used: set[str] = set()
         for path in paths:
             name = os.path.basename(path)
