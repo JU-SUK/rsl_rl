@@ -122,6 +122,26 @@ class WandbSummaryWriter(SummaryWriter):
         """Upload an arbitrary file artifact to W&B."""
         wandb.save(path, base_path=os.path.dirname(path))
 
+    def save_files(self, paths: list[str]) -> None:
+        """Bundle files into one synchronous ``wandb.Artifact`` upload.
+
+        Preferred over repeated :meth:`save_file` because ``wandb.save`` is racy on
+        short runs; ``log_artifact(...).wait()`` blocks until upload completes.
+        Files are added by basename; duplicate basenames are skipped with a warning.
+        """
+        if not paths:
+            return
+        art = wandb.Artifact(name="run-config", type="run-config")
+        names_used: set[str] = set()
+        for path in paths:
+            name = os.path.basename(path)
+            if name in names_used:
+                print(f"[WARN] artifact upload: duplicate basename {name!r}, skipping {path}")
+                continue
+            names_used.add(name)
+            art.add_file(path, name=name)
+        wandb.log_artifact(art).wait()
+
     def save_video(self, video: pathlib.Path, it: int) -> None:
         """Upload a video artifact once per filename to W&B."""
         if video.name not in self.logged_videos:

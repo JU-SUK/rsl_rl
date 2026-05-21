@@ -98,8 +98,12 @@ class Logger:
         # Upload configuration and code state to external logging service if applicable
         if self.writer is not None and self.logger_type in ["wandb", "neptune"]:
             self.writer.store_config(self.env_cfg, self.cfg)  # type: ignore
-            for path in files_to_upload:
-                self.writer.save_file(path)  # type: ignore
+            # Prefer a batched, synchronous artifact upload (W&B) when supported.
+            if files_to_upload and hasattr(self.writer, "save_files"):
+                self.writer.save_files(files_to_upload)  # type: ignore
+            else:
+                for path in files_to_upload:
+                    self.writer.save_file(path)  # type: ignore
 
     def process_env_step(
         self,
