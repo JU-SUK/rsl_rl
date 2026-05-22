@@ -155,6 +155,10 @@ class OnPolicyRunner:
             curriculum_state = self._get_curriculum_state()
             if curriculum_state:
                 saved_dict["curriculum_state"] = curriculum_state
+        if self.cfg.get("save_event_state", True):
+            event_state = self._get_event_state()
+            if event_state:
+                saved_dict["event_state"] = event_state
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
@@ -177,6 +181,8 @@ class OnPolicyRunner:
             self.current_learning_iteration = loaded_dict["iter"]
         if not self.cfg.get("reset_curriculum_on_load", False) and "curriculum_state" in loaded_dict:
             self._set_curriculum_state(loaded_dict["curriculum_state"])
+        if not self.cfg.get("reset_event_on_load", False) and "event_state" in loaded_dict:
+            self._set_event_state(loaded_dict["event_state"])
         return loaded_dict["infos"]
 
     def _compute_per_task_policy_metrics(self) -> dict[str, float] | None:
@@ -250,6 +256,22 @@ class OnPolicyRunner:
         """Restore curriculum state previously produced by :meth:`_get_curriculum_state`."""
         env = getattr(self.env, "unwrapped", self.env)
         manager = getattr(env, "curriculum_manager", None)
+        if manager is None or not hasattr(manager, "load_state_dict"):
+            return
+        manager.load_state_dict(state)
+
+    def _get_event_state(self) -> dict | None:
+        """Return the event manager's serializable state, or ``None`` if unavailable."""
+        env = getattr(self.env, "unwrapped", self.env)
+        manager = getattr(env, "event_manager", None)
+        if manager is None or not hasattr(manager, "state_dict"):
+            return None
+        return manager.state_dict()
+
+    def _set_event_state(self, state: dict) -> None:
+        """Restore event state previously produced by :meth:`_get_event_state`."""
+        env = getattr(self.env, "unwrapped", self.env)
+        manager = getattr(env, "event_manager", None)
         if manager is None or not hasattr(manager, "load_state_dict"):
             return
         manager.load_state_dict(state)

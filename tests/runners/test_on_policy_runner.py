@@ -335,6 +335,95 @@ class TestSaveLoad:
                 "reset_curriculum_on_load=True should skip the manager's load_state_dict"
             )
 
+    def test_event_state_round_trips_through_save_load(self) -> None:
+        """runner.save embeds event_state, runner.load calls manager.load_state_dict with it."""
+
+        class _FakeEventManager:
+            def __init__(self) -> None:
+                self.tensor = torch.tensor([4.0, 5.0, 6.0])
+                self.last_loaded: dict | None = None
+
+            def state_dict(self) -> dict:
+                return {"reset_term": {"x": self.tensor.clone()}}
+
+            def load_state_dict(self, state: dict) -> None:
+                self.last_loaded = state
+                self.tensor.copy_(state["reset_term"]["x"])
+
+        env = DummyEnv()
+        env.event_manager = _FakeEventManager()
+        runner = OnPolicyRunner(env, _make_train_cfg("mlp"), log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_dict = torch.load(f.name, weights_only=False, map_location="cpu")
+            assert "event_state" in saved_dict
+            assert torch.equal(saved_dict["event_state"]["reset_term"]["x"], torch.tensor([4.0, 5.0, 6.0]))
+
+            env2 = DummyEnv()
+            env2.event_manager = _FakeEventManager()
+            env2.event_manager.tensor.copy_(torch.tensor([99.0, 99.0, 99.0]))
+            runner2 = OnPolicyRunner(env2, _make_train_cfg("mlp"), log_dir=None, device="cpu")
+            runner2.load(f.name)
+
+            assert env2.event_manager.last_loaded is not None, "load_state_dict was never called"
+            assert torch.equal(env2.event_manager.tensor, torch.tensor([4.0, 5.0, 6.0]))
+
+    def test_save_event_state_false_omits_section(self) -> None:
+        """``save_event_state=False`` should skip the event_state key entirely."""
+
+        class _FakeEventManager:
+            def state_dict(self) -> dict:
+                return {"reset_term": {"x": torch.tensor([1.0])}}
+
+            def load_state_dict(self, state: dict) -> None:
+                pass
+
+        env = DummyEnv()
+        env.event_manager = _FakeEventManager()
+        cfg = _make_train_cfg("mlp")
+        cfg["save_event_state"] = False
+        runner = OnPolicyRunner(env, cfg, log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_dict = torch.load(f.name, weights_only=False, map_location="cpu")
+            assert "event_state" not in saved_dict
+
+    def test_reset_event_on_load_skips_restore(self) -> None:
+        """``reset_event_on_load=True`` should skip calling ``manager.load_state_dict``."""
+
+        class _FakeEventManager:
+            def __init__(self) -> None:
+                self.tensor = torch.tensor([1.0])
+                self.load_calls = 0
+
+            def state_dict(self) -> dict:
+                return {"reset_term": {"x": self.tensor.clone()}}
+
+            def load_state_dict(self, state: dict) -> None:
+                self.load_calls += 1
+
+        env = DummyEnv()
+        env.event_manager = _FakeEventManager()
+        runner = OnPolicyRunner(env, _make_train_cfg("mlp"), log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+
+            env2 = DummyEnv()
+            env2.event_manager = _FakeEventManager()
+            cfg2 = _make_train_cfg("mlp")
+            cfg2["reset_event_on_load"] = True
+            runner2 = OnPolicyRunner(env2, cfg2, log_dir=None, device="cpu")
+            runner2.load(f.name)
+            assert env2.event_manager.load_calls == 0, (
+                "reset_event_on_load=True should skip the manager's load_state_dict"
+            )
+
     def test_load_restores_optimizer_state(self) -> None:
         """Loading should restore Adam optimizer state (step, exp_avg, exp_avg_sq)."""
         runner = _build_runner()
