@@ -318,3 +318,58 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+class TestSaveLoad:
+    """Tests for ``PPO.save`` / ``PPO.load`` round-tripping."""
+
+    def test_learning_rate_round_trips(self) -> None:
+        """A non-default ``learning_rate`` survives a save+load into a fresh PPO."""
+        src, _ = _build_ppo(learning_rate=1e-3)
+        src.learning_rate = 7.5e-4
+        for pg in src.optimizer.param_groups:
+            pg["lr"] = src.learning_rate
+
+        saved = src.save()
+
+        dst, _ = _build_ppo(learning_rate=1e-3)
+        assert dst.learning_rate == 1e-3
+        dst.load(saved, load_cfg=None, strict=True)
+
+        assert dst.learning_rate == 7.5e-4
+        assert dst.optimizer.param_groups[0]["lr"] == 7.5e-4
+
+    def test_load_legacy_checkpoint_without_learning_rate(self) -> None:
+        """Loading a checkpoint missing the ``learning_rate`` key leaves the cfg LR."""
+        src, _ = _build_ppo(learning_rate=1e-3)
+        src.learning_rate = 7.5e-4
+        for pg in src.optimizer.param_groups:
+            pg["lr"] = src.learning_rate
+
+        saved = src.save()
+        saved.pop("learning_rate")
+
+        dst, _ = _build_ppo(learning_rate=1e-3)
+        dst.load(saved, load_cfg=None, strict=True)
+
+        assert dst.learning_rate == 1e-3
+        assert dst.optimizer.param_groups[0]["lr"] == 7.5e-4
+
+    def test_load_skips_learning_rate_when_optimizer_disabled(self) -> None:
+        """``load_cfg={'optimizer': False}`` leaves both the optimizer and LR untouched."""
+        src, _ = _build_ppo(learning_rate=1e-3)
+        src.learning_rate = 7.5e-4
+        for pg in src.optimizer.param_groups:
+            pg["lr"] = src.learning_rate
+
+        saved = src.save()
+
+        dst, _ = _build_ppo(learning_rate=1e-3)
+        dst.load(
+            saved,
+            load_cfg={"actor": True, "critic": True, "optimizer": False, "iteration": True, "rnd": True},
+            strict=True,
+        )
+
+        assert dst.learning_rate == 1e-3
+        assert dst.optimizer.param_groups[0]["lr"] == 1e-3

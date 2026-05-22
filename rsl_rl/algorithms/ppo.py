@@ -373,9 +373,7 @@ class PPO:
 
             # Apply the gradients for PPO
             if self.grad_norm_clip_mode == "unified":
-                nn.utils.clip_grad_norm_(
-                    chain(self.actor.parameters(), self.critic.parameters()), self.max_grad_norm
-                )
+                nn.utils.clip_grad_norm_(chain(self.actor.parameters(), self.critic.parameters()), self.max_grad_norm)
             else:
                 nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
@@ -458,6 +456,7 @@ class PPO:
             "actor_state_dict": self._raw_actor.state_dict(),
             "critic_state_dict": self._raw_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "learning_rate": self.learning_rate,
         }
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
@@ -483,6 +482,8 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+            if "learning_rate" in loaded_dict:
+                self.learning_rate = loaded_dict["learning_rate"]
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
