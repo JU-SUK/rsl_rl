@@ -94,6 +94,28 @@ class TestEmpiricalNormalization:
         assert not torch.any(torch.isnan(norm._mean))
         assert not torch.any(torch.isnan(norm._std))
 
+    def test_update_inside_inference_mode_preserves_buffer_storage(self) -> None:
+        """Updating inside ``torch.inference_mode`` must not replace ``_std`` with an inference tensor.
+
+        The runner's rollout loop is wrapped in ``inference_mode``; if ``update`` reassigns
+        ``self._std`` to a freshly-computed tensor instead of mutating in place, that tensor
+        becomes flagged as an inference tensor and any later in-place op (e.g. the
+        ``copy_`` inside ``state_dict.load_state_dict``) raises at runtime.
+        """
+        norm = EmpiricalNormalization(shape=2)
+        norm.train()
+        std_ref = norm._std
+
+        with torch.inference_mode():
+            norm.update(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+
+        assert norm._std is std_ref, "update must keep the registered buffer's tensor object"
+        assert not norm._std.is_inference()
+
+        saved = {"_std": norm._std.clone(), "_mean": norm._mean.clone(), "_var": norm._var.clone()}
+        # Re-loading should not raise.
+        norm._std.copy_(saved["_std"])
+
 
 class TestEmpiricalDiscountedVariationNormalization:
     """Tests for ``EmpiricalDiscountedVariationNormalization``."""
