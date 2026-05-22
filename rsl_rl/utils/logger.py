@@ -121,7 +121,7 @@ class Logger:
 
             # Buffer per-iteration log images (e.g. curriculum heatmap). Latest emission per
             # tag wins; the buffer is flushed and cleared in :meth:`log`.
-            if "log_images" in extras and extras["log_images"]:
+            if extras.get("log_images"):
                 self.log_images_buffer.update(extras["log_images"])
 
             # Update rewards and episode length
@@ -291,6 +291,37 @@ class Logger:
 
             # Clear extras buffer
             self.ep_extras.clear()
+
+    def state_dict(self) -> dict:
+        """Return a snapshot of the cross-iteration logger counters and buffers."""
+        state: dict = {
+            "tot_timesteps": self.tot_timesteps,
+            "tot_time": self.tot_time,
+            "rewbuffer": list(self.rewbuffer),
+            "lenbuffer": list(self.lenbuffer),
+            "cur_reward_sum": self.cur_reward_sum.detach().cpu().clone(),
+            "cur_episode_length": self.cur_episode_length.detach().cpu().clone(),
+        }
+        if self.cfg["algorithm"]["rnd_cfg"]:
+            state["erewbuffer"] = list(self.erewbuffer)
+            state["irewbuffer"] = list(self.irewbuffer)
+            state["cur_ereward_sum"] = self.cur_ereward_sum.detach().cpu().clone()
+            state["cur_ireward_sum"] = self.cur_ireward_sum.detach().cpu().clone()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the cross-iteration logger counters and buffers from a snapshot."""
+        self.tot_timesteps = int(state["tot_timesteps"])
+        self.tot_time = float(state["tot_time"])
+        self.rewbuffer = deque(state["rewbuffer"], maxlen=self.rewbuffer.maxlen)
+        self.lenbuffer = deque(state["lenbuffer"], maxlen=self.lenbuffer.maxlen)
+        self.cur_reward_sum.copy_(state["cur_reward_sum"].to(self.cur_reward_sum.device))
+        self.cur_episode_length.copy_(state["cur_episode_length"].to(self.cur_episode_length.device))
+        if self.cfg["algorithm"]["rnd_cfg"] and "erewbuffer" in state:
+            self.erewbuffer = deque(state["erewbuffer"], maxlen=self.erewbuffer.maxlen)
+            self.irewbuffer = deque(state["irewbuffer"], maxlen=self.irewbuffer.maxlen)
+            self.cur_ereward_sum.copy_(state["cur_ereward_sum"].to(self.cur_ereward_sum.device))
+            self.cur_ireward_sum.copy_(state["cur_ireward_sum"].to(self.cur_ireward_sum.device))
 
     def save_model(self, path: str, it: int) -> None:
         """Save the model to external logging services if specified."""

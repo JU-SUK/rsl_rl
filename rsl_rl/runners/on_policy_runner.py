@@ -159,6 +159,8 @@ class OnPolicyRunner:
             event_state = self._get_event_state()
             if event_state:
                 saved_dict["event_state"] = event_state
+        if self.cfg.get("save_logger_state", True):
+            saved_dict["logger_state"] = self.logger.state_dict()
         torch.save(saved_dict, path)
         # Upload model to external logging services
         self.logger.save_model(path, self.current_learning_iteration)
@@ -183,6 +185,8 @@ class OnPolicyRunner:
             self._set_curriculum_state(loaded_dict["curriculum_state"])
         if not self.cfg.get("reset_event_on_load", False) and "event_state" in loaded_dict:
             self._set_event_state(loaded_dict["event_state"])
+        if not self.cfg.get("reset_logger_on_load", False) and "logger_state" in loaded_dict:
+            self.logger.load_state_dict(loaded_dict["logger_state"])
         return loaded_dict["infos"]
 
     def _compute_per_task_policy_metrics(self) -> dict[str, float] | None:

@@ -424,6 +424,57 @@ class TestSaveLoad:
                 "reset_event_on_load=True should skip the manager's load_state_dict"
             )
 
+    def test_logger_state_round_trips_through_save_load(self) -> None:
+        """runner.save embeds the Logger's persistent counters and restores them on load."""
+        runner = OnPolicyRunner(DummyEnv(), _make_train_cfg("mlp"), log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=2)
+        # Force non-trivial Logger state so any restoration is observable.
+        runner.logger.tot_timesteps = 999
+        runner.logger.tot_time = 12.5
+        runner.logger.rewbuffer.append(3.14)
+        runner.logger.lenbuffer.append(42)
+        runner.logger.cur_reward_sum[:] = torch.tensor([0.1, 0.2, 0.3, 0.4])
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_dict = torch.load(f.name, weights_only=False, map_location="cpu")
+            assert "logger_state" in saved_dict
+
+            runner2 = OnPolicyRunner(DummyEnv(), _make_train_cfg("mlp"), log_dir=None, device="cpu")
+            runner2.load(f.name)
+            assert runner2.logger.tot_timesteps == 999
+            assert runner2.logger.tot_time == pytest.approx(12.5)
+            assert list(runner2.logger.rewbuffer) == [pytest.approx(3.14)]
+            assert list(runner2.logger.lenbuffer) == [42]
+            assert torch.equal(runner2.logger.cur_reward_sum, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+
+    def test_save_logger_state_false_omits_section(self) -> None:
+        """``save_logger_state=False`` should skip the logger_state key entirely."""
+        cfg = _make_train_cfg("mlp")
+        cfg["save_logger_state"] = False
+        runner = OnPolicyRunner(DummyEnv(), cfg, log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_dict = torch.load(f.name, weights_only=False, map_location="cpu")
+            assert "logger_state" not in saved_dict
+
+    def test_reset_logger_on_load_skips_restore(self) -> None:
+        """``reset_logger_on_load=True`` should skip calling ``logger.load_state_dict``."""
+        runner = OnPolicyRunner(DummyEnv(), _make_train_cfg("mlp"), log_dir=None, device="cpu")
+        runner.learn(num_learning_iterations=1)
+        runner.logger.tot_timesteps = 999
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+
+            cfg2 = _make_train_cfg("mlp")
+            cfg2["reset_logger_on_load"] = True
+            runner2 = OnPolicyRunner(DummyEnv(), cfg2, log_dir=None, device="cpu")
+            runner2.load(f.name)
+            assert runner2.logger.tot_timesteps == 0, "reset_logger_on_load=True should skip the logger restore"
+
     def test_load_restores_optimizer_state(self) -> None:
         """Loading should restore Adam optimizer state (step, exp_avg, exp_avg_sq)."""
         runner = _build_runner()
@@ -436,8 +487,7 @@ class TestSaveLoad:
             runner.learn(num_learning_iterations=2)
             current = runner.alg.optimizer.state_dict()["state"]
             assert any(
-                isinstance(saved[pid][field], torch.Tensor)
-                and not torch.equal(saved[pid][field], current[pid][field])
+                isinstance(saved[pid][field], torch.Tensor) and not torch.equal(saved[pid][field], current[pid][field])
                 for pid in saved
                 for field in ("exp_avg", "exp_avg_sq")
             ), "Optimizer moments should change after additional training"
@@ -642,7 +692,7 @@ class TestGradientNoiseScaleIntegration:
         assert "noise_scale/G_sq" in loss_dict
         assert "noise_scale/sigma_tr" in loss_dict
         # After one update the denominator EMA must have moved off its initial zero.
-        assert loss_dict["noise_scale/G_sq"] != 0.0
+        assert abs(loss_dict["noise_scale/G_sq"]) > 0.0
 
     def test_within_minibatch_mode_still_unimplemented(self) -> None:
         """The within_minibatch mode is reserved but not implemented yet."""
