@@ -461,6 +461,8 @@ class PPO:
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.rnd.optimizer.state_dict()
+        if self.noise_scale_tracker is not None:
+            saved_dict["noise_scale_tracker"] = self.noise_scale_tracker.state_dict()
         return saved_dict
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
@@ -487,6 +489,8 @@ class PPO:
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+        if "noise_scale_tracker" in loaded_dict and self.noise_scale_tracker is not None:
+            self.noise_scale_tracker.load_state_dict(loaded_dict["noise_scale_tracker"])
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:

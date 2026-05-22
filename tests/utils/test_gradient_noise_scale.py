@@ -263,3 +263,89 @@ class TestAccumulateGuards:
         # accumulate_minibatch was never called, so _sum_grad is still None.
         with pytest.raises(RuntimeError, match="accumulate_minibatch"):
             t.step_across_minibatches(b_small=4, num_mini_batches=2)
+
+
+# ---------------------------------------------------------------------------
+# Save / load round trip
+# ---------------------------------------------------------------------------
+
+
+class TestSaveLoad:
+    """``state_dict`` / ``load_state_dict`` preserve the persistent EMA counters."""
+
+    def test_round_trip_preserves_ema_state(self) -> None:
+        """A non-trivial EMA history round-trips through save+load into a fresh tracker."""
+        mu = torch.full((8,), 0.5)
+        rng = torch.Generator()
+        rng.manual_seed(42)
+        src = GradientNoiseScaleTracker(mode="ddp_native", ema_decay=0.9)
+        for _ in range(25):
+            big_mean, shard_means = _simulate_shards(rng, mu, sigma=1.0, b_big=16, b_small=4)
+            _step_mode(src, big_mean, shard_means, 4)
+
+        assert src.num_updates == 25
+        snapshot = src.state_dict()
+
+        dst = GradientNoiseScaleTracker(mode="ddp_native", ema_decay=0.9)
+        ema_g_sq_ref = dst.ema_g_sq
+        ema_sigma_tr_ref = dst.ema_sigma_tr
+        dst.load_state_dict(snapshot)
+
+        assert dst.num_updates == 25
+        assert torch.equal(dst.ema_g_sq, src.ema_g_sq)
+        assert torch.equal(dst.ema_sigma_tr, src.ema_sigma_tr)
+        # In-place restore must keep the original buffer tensor objects alive.
+        assert dst.ema_g_sq is ema_g_sq_ref
+        assert dst.ema_sigma_tr is ema_sigma_tr_ref
+
+    def test_snapshot_decoupled_from_source(self) -> None:
+        """Continuing to update the source after ``state_dict`` does not mutate the snapshot."""
+        mu = torch.full((4,), 0.0)
+        rng = torch.Generator()
+        rng.manual_seed(1)
+        src = GradientNoiseScaleTracker(mode="ddp_native", ema_decay=0.9)
+        for _ in range(5):
+            big_mean, shard_means = _simulate_shards(rng, mu, sigma=1.0, b_big=8, b_small=2)
+            _step_mode(src, big_mean, shard_means, 2)
+        snapshot = src.state_dict()
+
+        for _ in range(5):
+            big_mean, shard_means = _simulate_shards(rng, mu, sigma=1.0, b_big=8, b_small=2)
+            _step_mode(src, big_mean, shard_means, 2)
+
+        # Source has advanced, but the snapshot must still reflect the earlier state.
+        assert src.num_updates == 10
+        assert snapshot["num_updates"] == 5
+        assert not torch.equal(snapshot["ema_g_sq"], src.ema_g_sq)
+
+    def test_resumed_updates_match_uninterrupted_run(self) -> None:
+        """A save+load mid-stream produces the same final EMAs as a single-shot run."""
+        mu = torch.full((4,), 0.1)
+
+        # Reference: 8 updates on one tracker.
+        rng_ref = torch.Generator()
+        rng_ref.manual_seed(7)
+        ref = GradientNoiseScaleTracker(mode="ddp_native", ema_decay=0.9)
+        for _ in range(8):
+            big_mean, shard_means = _simulate_shards(rng_ref, mu, sigma=1.0, b_big=8, b_small=2)
+            _step_mode(ref, big_mean, shard_means, 2)
+
+        # Run: 4 updates, save, then 4 more on a fresh tracker that loaded the snapshot.
+        # Share the same RNG so the simulated minibatches are identical.
+        rng_run = torch.Generator()
+        rng_run.manual_seed(7)
+        run = GradientNoiseScaleTracker(mode="ddp_native", ema_decay=0.9)
+        for _ in range(4):
+            big_mean, shard_means = _simulate_shards(rng_run, mu, sigma=1.0, b_big=8, b_small=2)
+            _step_mode(run, big_mean, shard_means, 2)
+        snapshot = run.state_dict()
+
+        resumed = GradientNoiseScaleTracker(mode="ddp_native", ema_decay=0.9)
+        resumed.load_state_dict(snapshot)
+        for _ in range(4):
+            big_mean, shard_means = _simulate_shards(rng_run, mu, sigma=1.0, b_big=8, b_small=2)
+            _step_mode(resumed, big_mean, shard_means, 2)
+
+        assert torch.equal(resumed.ema_g_sq, ref.ema_g_sq)
+        assert torch.equal(resumed.ema_sigma_tr, ref.ema_sigma_tr)
+        assert resumed.num_updates == ref.num_updates

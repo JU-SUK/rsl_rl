@@ -373,3 +373,35 @@ class TestSaveLoad:
 
         assert dst.learning_rate == 1e-3
         assert dst.optimizer.param_groups[0]["lr"] == 1e-3
+
+    def test_noise_scale_tracker_round_trips(self) -> None:
+        """A non-trivial tracker EMA state round-trips through PPO.save / PPO.load."""
+        src, _ = _build_ppo(gradient_noise_scale_cfg={})
+        assert src.noise_scale_tracker is not None
+        src.noise_scale_tracker.ema_g_sq.fill_(0.7)
+        src.noise_scale_tracker.ema_sigma_tr.fill_(0.4)
+        src.noise_scale_tracker.num_updates = 17
+
+        saved = src.save()
+        assert "noise_scale_tracker" in saved
+
+        dst, _ = _build_ppo(gradient_noise_scale_cfg={})
+        assert dst.noise_scale_tracker.num_updates == 0
+        dst.load(saved, load_cfg=None, strict=True)
+
+        assert dst.noise_scale_tracker.num_updates == 17
+        assert torch.allclose(dst.noise_scale_tracker.ema_g_sq, torch.tensor(0.7))
+        assert torch.allclose(dst.noise_scale_tracker.ema_sigma_tr, torch.tensor(0.4))
+
+    def test_load_legacy_checkpoint_without_noise_scale_tracker(self) -> None:
+        """A checkpoint missing the tracker key leaves the dst tracker at its construction defaults."""
+        src, _ = _build_ppo(gradient_noise_scale_cfg={})
+        src.noise_scale_tracker.ema_g_sq.fill_(0.7)
+        saved = src.save()
+        saved.pop("noise_scale_tracker")
+
+        dst, _ = _build_ppo(gradient_noise_scale_cfg={})
+        dst.load(saved, load_cfg=None, strict=True)
+
+        assert dst.noise_scale_tracker.num_updates == 0
+        assert torch.equal(dst.noise_scale_tracker.ema_g_sq, torch.zeros(()))

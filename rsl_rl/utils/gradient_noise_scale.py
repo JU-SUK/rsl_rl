@@ -179,6 +179,22 @@ class GradientNoiseScaleTracker:
         self._sum_norm_sq = None
         self._sum_grad = None
 
+    # ---- public API: save/load ------------------------------------------
+
+    def state_dict(self) -> dict:
+        """Return a snapshot of the persistent EMA counters."""
+        return {
+            "ema_g_sq": self.ema_g_sq.detach().cpu().clone(),
+            "ema_sigma_tr": self.ema_sigma_tr.detach().cpu().clone(),
+            "num_updates": self.num_updates,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore the persistent EMA counters from :meth:`state_dict` output."""
+        self.ema_g_sq.copy_(state["ema_g_sq"].to(self.ema_g_sq.device))
+        self.ema_sigma_tr.copy_(state["ema_sigma_tr"].to(self.ema_sigma_tr.device))
+        self.num_updates = int(state["num_updates"])
+
     # ---- public API: within_minibatch -----------------------------------
 
     def step_within_minibatch(
