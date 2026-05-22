@@ -425,10 +425,14 @@ class TestSaveLoad:
             )
 
     def test_logger_state_round_trips_through_save_load(self) -> None:
-        """runner.save embeds the Logger's persistent counters and restores them on load."""
+        """runner.save embeds the Logger's persistent counters and restores them on load.
+
+        Per-env counters that reset on episode boundaries (``cur_reward_sum``,
+        ``cur_episode_length``) are deliberately not persisted — on resume the env
+        restarts cleanly and those refill naturally as new episodes complete.
+        """
         runner = OnPolicyRunner(DummyEnv(), _make_train_cfg("mlp"), log_dir=None, device="cpu")
         runner.learn(num_learning_iterations=2)
-        # Force non-trivial Logger state so any restoration is observable.
         runner.logger.tot_timesteps = 999
         runner.logger.tot_time = 12.5
         runner.logger.rewbuffer.append(3.14)
@@ -446,7 +450,8 @@ class TestSaveLoad:
             assert runner2.logger.tot_time == pytest.approx(12.5)
             assert list(runner2.logger.rewbuffer) == [pytest.approx(3.14)]
             assert list(runner2.logger.lenbuffer) == [42]
-            assert torch.equal(runner2.logger.cur_reward_sum, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+            # cur_reward_sum stays at construction zero — by design.
+            assert torch.equal(runner2.logger.cur_reward_sum, torch.zeros(NUM_ENVS))
 
     def test_save_logger_state_false_omits_section(self) -> None:
         """``save_logger_state=False`` should skip the logger_state key entirely."""
