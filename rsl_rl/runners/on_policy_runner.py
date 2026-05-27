@@ -53,6 +53,7 @@ class OnPolicyRunner:
         )
 
         self.current_learning_iteration = 0
+        self._resumed = False
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         """Run the learning loop for the specified number of iterations."""
@@ -73,6 +74,11 @@ class OnPolicyRunner:
 
         # Initialize the logging writer
         self.logger.init_logging_writer()
+
+        # Optional warmup: rollouts without gradient updates to fill success monitors.
+        warmup_iters = self.cfg.get("resume_warmup_iterations", 0)
+        if self._resumed and warmup_iters > 0:
+            self._run_warmup(obs, warmup_iters)
 
         # Start training
         start_it = self.current_learning_iteration
@@ -187,7 +193,34 @@ class OnPolicyRunner:
             self._set_event_state(loaded_dict["event_state"])
         if not self.cfg.get("reset_logger_on_load", False) and "logger_state" in loaded_dict:
             self.logger.load_state_dict(loaded_dict["logger_state"])
+        self._resumed = True
         return loaded_dict["infos"]
+
+    def _run_warmup(self, obs: torch.Tensor, num_iters: int) -> None:
+        """Roll out the policy without gradient updates to fill success monitors."""
+        if self.gpu_global_rank == 0:
+            print(f"[warmup] Running {num_iters} rollout-only iterations to fill success monitors...")
+        num_steps = self.cfg["num_steps_per_env"]
+        for w in range(num_iters):
+            with torch.inference_mode():
+                self.alg.reset_sde_noise(self.env.num_envs)
+                for step in range(num_steps):
+                    if self.alg.sde_sample_freq > 0 and step > 0 and step % self.alg.sde_sample_freq == 0:
+                        self.alg.reset_sde_noise(self.env.num_envs)
+                    actions = self.alg.act(obs)
+                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    if self.cfg.get("check_for_nan", True):
+                        check_nan(obs, rewards, dones)
+                    obs, rewards, dones = obs.to(self.device), rewards.to(self.device), dones.to(self.device)
+                    self.alg.process_env_step(obs, rewards, dones, extras)
+                    self.logger.process_env_step(rewards, dones, extras, None)
+            self.alg.storage.clear()
+            if self.gpu_global_rank == 0:
+                ep_done = dones.sum().item()
+                mean_rew = rewards.mean().item()
+                print(f"[warmup] iter {w + 1}/{num_iters}  eps_done={ep_done:.0f}  mean_rew={mean_rew:.3f}")
+        if self.gpu_global_rank == 0:
+            print(f"[warmup] Done ({num_iters} iterations).")
 
     def _compute_per_task_policy_metrics(self) -> dict[str, float] | None:
         """Per-terrain-type policy metrics over the just-collected rollout.
