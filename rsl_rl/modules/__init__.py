@@ -10,6 +10,11 @@ from .distribution import Distribution, GaussianDistribution, GsdeDistribution, 
 from .mlp import MLP
 from .normalization import EmpiricalDiscountedVariationNormalization, EmpiricalNormalization
 from .rnn import RNN, HiddenState
+from .student_teacher import StudentTeacher
+from .student_teacher_vision import StudentTeacherVision
+
+# NOTE: StudentTeacherRecurrent intentionally skipped — depends on rsl_rl.networks.Memory
+# which feature/manipulation hasn't ported. Re-add once the recurrent student is needed.
 
 __all__ = [
     "CNN",
@@ -22,4 +27,6 @@ __all__ = [
     "GsdeDistribution",
     "HeteroscedasticGaussianDistribution",
     "HiddenState",
+    "StudentTeacher",
+    "StudentTeacherVision",
 ]
