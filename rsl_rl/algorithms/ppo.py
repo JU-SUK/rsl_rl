@@ -277,8 +277,15 @@ class PPO:
                     for param_group in self.optimizer.param_groups:
                         param_group["lr"] = self.learning_rate
 
-            # Surrogate loss
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
+            # Surrogate loss. The log-ratio is clamped before exponentiation: with squashed/bounded
+            # distributions (e.g. TanhGaussianDistribution) the Jacobian-corrected log-probs of
+            # saturated actions can legitimately differ by more than ~88 between collection and
+            # update, and exp() then overflows to inf -> inf surrogate -> NaN gradients -> NaN
+            # network weights. exp(+-20) keeps the ratio finite while staying far outside the PPO
+            # clip range, so the clamp is inactive for healthy updates (plain Gaussians live at
+            # |log-ratio| < ~5) and only arrests numerical blow-ups.
+            log_ratio = actions_log_prob - torch.squeeze(batch.old_actions_log_prob)  # type: ignore
+            ratio = torch.exp(torch.clamp(log_ratio, -20.0, 20.0))
             surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
             surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
                 ratio, 1.0 - self.clip_param, 1.0 + self.clip_param

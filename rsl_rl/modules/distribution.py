@@ -325,6 +325,65 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
             torch.nn.init.constant_(mlp[-2].bias[self.output_dim :], init_std_log)  # type: ignore
 
 
+class TanhGaussianDistribution(HeteroscedasticGaussianDistribution):
+    """Tanh-squashed Gaussian (Brax ``NormalTanhDistribution`` style) for bounded actions in ``[-1, 1]``.
+
+    Inherits the heteroscedastic (state-dependent std) base Gaussian over the pre-squash variable ``u``; the
+    executed action is ``a = tanh(u)``. Compared to squashing in the environment, doing it in the policy is the
+    design deployed for sim-to-real (Brax / MuJoCo Playground):
+
+    * :meth:`log_prob` applies the change-of-variables correction ``- sum log(1 - a^2 + eps)``.
+    * :attr:`entropy` is estimated from a reparameterized sample (the squashed entropy has no closed form). The
+      sampled entropy is *bounded*, so the entropy bonus stops paying for larger std once actions saturate —
+      the std self-regulates, instead of inflating to a bang-bang policy (the failure mode of env-side tanh).
+    * :attr:`params` / :attr:`std` / :meth:`kl_divergence` use the raw base Gaussian, so the adaptive-LR KL is
+      computed on the unsquashed distribution (correct and stable).
+
+    Numerically guarded with a clamped ``atanh`` and a ``min_std`` floor (set via ``std_range[0]``; use ~1e-3).
+    """
+
+    _TANH_EPS = 1e-6
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the base Gaussian with non-finite network outputs sanitized first.
+
+        ``torch.clamp`` passes NaN through and ``Normal`` raises on a NaN/inf std at sample
+        time, which hard-crashes a multi-GPU run. A transient inf/NaN in the actor output
+        (e.g. one bad minibatch elsewhere) is mapped to a safe value instead: NaN -> 0,
+        +-inf -> +-10 (a pre-squash mean of +-10 already saturates tanh; a log-std of +-10
+        is clamped by ``log_std_range``/``std_range`` in the base update).
+        """
+        super().update(torch.nan_to_num(mlp_output, nan=0.0, posinf=10.0, neginf=-10.0))
+
+    def sample(self) -> torch.Tensor:
+        """Sample ``u ~ N(mean, std)`` and return the squashed action ``tanh(u)``."""
+        return torch.tanh(self._distribution.sample())  # type: ignore
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Squashed mean: ``tanh`` of the heteroscedastic mean slice."""
+        return torch.tanh(super().deterministic_output(mlp_output))
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Export-friendly module returning ``tanh(mean_slice)``."""
+        return _TanhMeanSliceDeterministicOutput()
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Squashed log-prob: base Gaussian log-prob of ``atanh(a)`` minus the tanh Jacobian, summed."""
+        a = outputs.clamp(-1.0 + self._TANH_EPS, 1.0 - self._TANH_EPS)
+        u = torch.atanh(a)
+        base = self._distribution.log_prob(u).sum(dim=-1)  # type: ignore
+        correction = torch.log(1.0 - a.pow(2) + self._TANH_EPS).sum(dim=-1)
+        return base - correction
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """Sampled entropy of the squashed distribution, ``-E_u[log p(tanh(u))]`` (bounded, differentiable)."""
+        u = self._distribution.rsample()  # type: ignore  # reparameterized so the entropy bonus has a gradient
+        base = self._distribution.log_prob(u).sum(dim=-1)  # type: ignore
+        correction = torch.log(1.0 - torch.tanh(u).pow(2) + self._TANH_EPS).sum(dim=-1)
+        return -(base - correction)
+
+
 class GsdeDistribution(GaussianDistribution):
     """Generalized State-Dependent Exploration (gSDE) Gaussian distribution.
 
@@ -505,3 +564,10 @@ class _MeanSliceDeterministicOutput(nn.Module):
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
         return mlp_output[..., 0, :]
+
+
+class _TanhMeanSliceDeterministicOutput(nn.Module):
+    """Exportable module returning ``tanh`` of the mean slice (for :class:`TanhGaussianDistribution`)."""
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(mlp_output[..., 0, :])
