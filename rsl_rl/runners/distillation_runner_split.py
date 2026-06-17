@@ -5,66 +5,68 @@
 
 """DistillationRunner with a fixed per-env student/teacher pool split.
 
-Assigns the first ``round(num_envs * student_fraction)`` envs to the student
-pool and the rest to the teacher pool; the assignment is fixed for the entire
-training run. The mask is:
+Ported from pat-gravity's ``uwlab_rl.rsl_rl.distillation_runner_split`` and
+re-targeted at feature/manipulation's :class:`rsl_rl.runners.OnPolicyRunner` API
+(``self.logger`` instead of ``self.writer`` / ``self._prepare_logging_writer``).
 
-* passed to :class:`DistillationDAgger` via ``student_mask`` so action routing
-  honors the split, and
-* stashed on ``env.unwrapped.pool_mask`` so the reset event
-  (:class:`MultiResetManager`) can log ``Metrics/success_student_only`` and
-  ``Metrics/success_teacher_only`` alongside the usual per-task success rates.
+Env layout along the batch axis:
 
-Per-pool success/length are also tracked in the runner's rollout loop as a
-fallback: IsaacLab's ``ManagerBasedRLEnv._reset_idx`` wipes ``extras["log"]``
-after the reset-mode event terms run, so ``MultiResetManager``'s writes are
-only preserved by coincidence at certain rollout cadences. Tracking here is
-cadence-independent and writes directly to the SummaryWriter each iter.
+* ``[0, num_student_eval)`` — student-eval (no-grad, student drives). Pure
+  inference signal even at tight train cadences where same-step gradients
+  create echo-of-teacher bias on the train pool.
+* ``[num_student_eval, num_eval)`` — teacher-eval (no-grad, teacher drives).
+* ``[num_eval, num_eval + num_student_train)`` — student-train (gradient).
+* ``[num_eval + num_student_train, num_envs)`` — teacher-train (gradient).
+
+The masks are injected into the algorithm cfg so :class:`DistillationDAgger`
+applies them to action mixing + loss masking, and stashed on
+``env.unwrapped.{pool_mask, eval_mask}`` so visual-DR events can target the
+no-grad eval pool with OOD textures.
 """
 
 from __future__ import annotations
 
+import os
+import statistics
+import time
 from collections import deque
 
 import torch
-from tensordict import TensorDict
 
-from rsl_rl.algorithms import Distillation
 from rsl_rl.env import VecEnv
-from rsl_rl.modules import StudentTeacher
 from rsl_rl.runners import DistillationRunner
-from rsl_rl.utils import resolve_obs_groups
 
 
 class DistillationRunnerSplit(DistillationRunner):
-    """DistillationRunner that fixes a per-env student/teacher/eval pool split.
+    """:class:`DistillationRunner` + fixed student/teacher/eval pool split.
 
-    Env layout along the batch axis:
+    Subclasses ``DistillationRunner`` (which itself subclasses ``OnPolicyRunner``
+    on this branch). Overrides ``__init__`` to compute the per-env mask and
+    inject it into the algorithm cfg before :meth:`OnPolicyRunner.__init__`
+    constructs the algorithm via :meth:`DistillationDAgger.construct_algorithm`.
 
-    * envs ``[0, num_eval)``           — eval-only: student drives; transitions
-      **excluded from gradient update**. Pure inference signal even at tight
-      train cadences where same-step gradients create echo-of-teacher bias.
-    * envs ``[num_eval, num_eval+num_student_train)`` — train-student: student
-      drives; transitions in gradient.
-    * envs ``[num_eval+num_student_train, num_envs)`` — train-teacher: teacher
-      drives; transitions in gradient.
+    The rollout loop in :meth:`learn` reimplements parent logic so each step
+    can route teacher actions on the teacher pool, exclude eval transitions
+    from the loss, track per-pool rolling success rates, and log them to
+    :attr:`self.logger.writer` alongside the standard PPO metrics.
     """
+
+    # --------------------------------------------------------------------- #
+    # Setup                                                                 #
+    # --------------------------------------------------------------------- #
 
     def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
         # Strip split-only keys before the parent sees the cfg.
         self.student_fraction = float(train_cfg.pop("student_fraction", 0.5))
         self.eval_fraction = float(train_cfg.pop("eval_fraction", 0.0))
-        # Of the eval pool, what fraction runs teacher actions (no-grad teacher rate).
-        # Default 0 = backward-compatible (eval is all student). Set to 0.5 for
-        # half-student / half-teacher eval — useful to verify teacher is solving the
-        # env at the same time we measure student eval.
         self.teacher_eval_fraction = float(train_cfg.pop("teacher_eval_fraction", 0.0))
-        if not 0.0 <= self.student_fraction <= 1.0:
-            raise ValueError(f"student_fraction must be in [0, 1]; got {self.student_fraction}")
-        if not 0.0 <= self.eval_fraction <= 1.0:
-            raise ValueError(f"eval_fraction must be in [0, 1]; got {self.eval_fraction}")
-        if not 0.0 <= self.teacher_eval_fraction <= 1.0:
-            raise ValueError(f"teacher_eval_fraction must be in [0, 1]; got {self.teacher_eval_fraction}")
+        for name, v in [
+            ("student_fraction", self.student_fraction),
+            ("eval_fraction", self.eval_fraction),
+            ("teacher_eval_fraction", self.teacher_eval_fraction),
+        ]:
+            if not 0.0 <= v <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]; got {v}")
 
         num_envs = env.num_envs
         num_eval = round(num_envs * self.eval_fraction)
@@ -74,17 +76,10 @@ class DistillationRunnerSplit(DistillationRunner):
         num_student_train = round(num_train * self.student_fraction)
         num_teacher_train = num_train - num_student_train
 
-        # Env layout (first→last along batch axis):
-        #   [0, num_student_eval)                                         — student-eval (no-grad, student)
-        #   [num_student_eval, num_eval)                                  — teacher-eval (no-grad, teacher)
-        #   [num_eval, num_eval + num_student_train)                      — student-train (grad, student)
-        #   [num_eval + num_student_train, num_envs)                      — teacher-train (grad, teacher)
         student_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
         student_mask[:num_student_eval] = True
         student_mask[num_eval : num_eval + num_student_train] = True
 
-        # eval_mask flags envs whose transitions are masked out of the BC gradient
-        # (covers both student-eval and teacher-eval).
         eval_mask = torch.zeros(num_envs, dtype=torch.bool, device=device)
         eval_mask[:num_eval] = True
 
@@ -94,37 +89,41 @@ class DistillationRunnerSplit(DistillationRunner):
         self.num_student_eval = num_student_eval
         self.num_teacher_eval = num_teacher_eval
         self.num_student_train = num_student_train
-        self.num_teacher = num_teacher_train  # legacy alias
         self.num_teacher_train = num_teacher_train
 
-        # Inject masks into the algorithm cfg so _construct_algorithm passes them
-        # to DistillationDAgger.__init__.
+        # Inject masks into the algorithm cfg so DistillationDAgger.__init__ binds them.
         train_cfg["algorithm"] = dict(train_cfg["algorithm"])
         train_cfg["algorithm"]["student_mask"] = student_mask
         train_cfg["algorithm"]["eval_mask"] = eval_mask
 
-        # Expose pool mask to the env for the reset event's per-pool success logging
-        # (legacy; may be partially wiped by ManagerBasedRLEnv._reset_idx on certain
-        # cadences — this runner also tracks per-pool success internally below).
+        # Expose for env-side visual DR / per-pool obs randomization.
         env.unwrapped.pool_mask = student_mask.to(env.unwrapped.device)
-        # Also expose eval_mask so visual-DR events can apply OOD textures / etc.
-        # to no-grad eval envs only.
         env.unwrapped.eval_mask = eval_mask.to(env.unwrapped.device)
 
         super().__init__(env, train_cfg, log_dir=log_dir, device=device)
 
-        # Rolling per-pool success buffers (cadence-independent). Four pools:
-        # student-eval, teacher-eval, student-train, teacher-train.
+        # Rolling per-pool success buckets. Cadence-independent (don't rely on
+        # the reset event populating extras["log"] on every step).
         self._pool_buf_len = 1024
         self._student_train_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
-        self._teacher_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)  # teacher-train
+        self._teacher_train_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
         self._student_eval_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
         self._teacher_eval_success_buf: deque[float] = deque(maxlen=self._pool_buf_len)
-        # BC loss on the student-eval pool: MSE between the no-grad student action
-        # and the teacher action on the same obs. Teacher action is already computed
-        # for all envs in self.alg.act() so this is essentially free per step.
-        # On OOD-texture eval (per rgb_dagger_cfg) this is a direct sim2real proxy.
+        # Per-reset-bucket success: {(pool, tag_name): deque}. pool in
+        # student_train/teacher_train/student_eval/teacher_eval; tag_name is the reset
+        # strategy (grasp_asset_in_air / start_assembled / start_grasped). Lets us see
+        # which reset types the teacher/student succeed on, per pool.
+        from collections import defaultdict as _defaultdict
+        self._bucket_success = _defaultdict(lambda: deque(maxlen=self._pool_buf_len))
+        # MSE(student_action, teacher_action) on the no-grad student-eval pool.
+        # Direct sim2real proxy when visual DR fires OOD textures on this pool.
         self._bc_loss_student_eval_buf: deque[float] = deque(maxlen=self._pool_buf_len)
+
+        # Also keep a regular reward + length buffer for parity with
+        # OnPolicyRunner.learn (logger reads from logger.rewbuffer, but BC has
+        # no advantage rewards so we hand-fill them here for cadence parity).
+        self._rewbuffer: deque[float] = deque(maxlen=100)
+        self._lenbuffer: deque[float] = deque(maxlen=100)
 
         print(
             f"[DistillationRunnerSplit] pool split: "
@@ -134,23 +133,12 @@ class DistillationRunnerSplit(DistillationRunner):
             f"teacher_eval_fraction={self.teacher_eval_fraction})"
         )
 
+    # --------------------------------------------------------------------- #
+    # Training loop                                                         #
+    # --------------------------------------------------------------------- #
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:  # type: ignore[override]
-        """Rollout + update loop with per-pool success tracking injected."""
-        import os
-        import time
-        from collections import deque
-
-        import rsl_rl
-
-        # ``store_code_state`` lives on patrickhaoy/main but not on UW-Lab/feature/manipulation;
-        # tolerantly skip if unavailable (git-status repo dump is logging-only, not required).
-        try:
-            from rsl_rl.utils import store_code_state  # type: ignore
-        except ImportError:
-            store_code_state = None  # type: ignore
-
-        # Prepare logging (mirrors parent)
-        self._prepare_logging_writer()
+        """Rollout + update loop with per-pool success tracking."""
         if not self.alg.policy.loaded_teacher:
             raise ValueError("Teacher model parameters not loaded. Please load a teacher model to distill.")
 
@@ -160,148 +148,204 @@ class DistillationRunnerSplit(DistillationRunner):
             )
 
         obs = self.env.get_observations().to(self.device)
-        self.train_mode()
-
-        ep_infos = []
-        rewbuffer: deque[float] = deque(maxlen=100)
-        lenbuffer: deque[float] = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        self.alg.policy.train()
 
         if self.is_distributed:
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
 
-        start_iter = self.current_learning_iteration
-        tot_iter = start_iter + num_learning_iterations
+        # Initialize the logging writer.
+        self.logger.init_logging_writer()
 
-        # Cache the underlying env's progress-context reward term for direct per-env success reads.
-        # Accessed once; if unavailable, per-pool tracking is skipped for that run.
-        reward_mgr = getattr(self.env.unwrapped, "reward_manager", None)
-        progress_term = None
-        if reward_mgr is not None:
-            try:
-                progress_term = reward_mgr.get_term_cfg("progress_context").func
-            except Exception:
-                progress_term = None
+        # Cache the per-env success signal source. Optional — if the env
+        # doesn't expose a success termination term we just skip pool tracking.
+        try:
+            success_term = self.env.unwrapped.termination_manager.get_term("success")
+        except (AttributeError, KeyError):
+            success_term = None
 
-        for it in range(start_iter, tot_iter):
+        # Cache the reset accumulator so we can attribute each done env's success to
+        # the reset strategy (bucket) it was reset from (``sampled_tags`` per env).
+        try:
+            _acc = self.env.unwrapped.event_manager.get_term_cfg("reset_positioning").func
+            _bucket_names = list(_acc.names)
+        except Exception:
+            _acc = None
+            _bucket_names = []
+
+        cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+
+        start_it = self.current_learning_iteration
+        total_it = start_it + num_learning_iterations
+        for it in range(start_it, total_it):
             start = time.time()
-            # Rollouts in eval mode: encoder skips photometric augs (only
-            # imagenet_norm applies). The augs fire only during the gradient
+            # Rollouts in eval mode: encoder skips photometric augs (only the
+            # imagenet_norm step applies). Augs fire only during the gradient
             # update below, on the train-pool data. This is what makes the
             # eval pool's success metric a clean signal.
-            self.eval_mode()
+            self.alg.policy.eval()
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
+                for _ in range(self.cfg["num_steps_per_env"]):
                     actions = self.alg.act(obs)
-                    # Per-step BC loss on student-eval envs (no-grad). Teacher
-                    # action was already computed inside self.alg.act() and stored
-                    # on self.alg.transition.privileged_actions.
-                    student_eval_m = self.student_mask.to(actions.device) & self.eval_mask.to(actions.device)
+                    # Per-step BC loss on the student-eval pool. Teacher action
+                    # was already computed inside alg.act() and stored on
+                    # alg.transition.privileged_actions.
+                    student_eval_m = self.student_mask & self.eval_mask
                     if student_eval_m.any():
                         teacher_act = self.alg.transition.privileged_actions
                         diff = (actions[student_eval_m] - teacher_act[student_eval_m]) ** 2
                         self._bc_loss_student_eval_buf.append(diff.mean().item())
+
+                    # Snapshot the per-env reset tag BEFORE stepping: env.step auto-
+                    # resets done envs in-place (overwriting sampled_tags with the NEXT
+                    # episode's tag), so we must capture the ending episode's tag now to
+                    # attribute its success to the correct reset bucket.
+                    _pre_tags = (
+                        _acc.sampled_tags.clone()
+                        if _acc is not None and getattr(_acc, "sampled_tags", None) is not None
+                        else None
+                    )
                     obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     self.alg.process_env_step(obs, rewards, dones, extras)
 
-                    # Per-pool success tracking (cadence-independent).
-                    # Four categories: {student, teacher} × {eval, train}.
-                    # ``corrupted_camera``-terminated envs are EXCLUDED from the
-                    # success metric: it's a rendering glitch (camera std<10),
-                    # not a policy failure, and shouldn't pollute success-rate.
-                    if progress_term is not None:
+                    cur_reward_sum += rewards
+                    cur_episode_length += 1
+                    new_ids = (dones > 0).nonzero(as_tuple=False)
+                    if new_ids.numel() > 0:
+                        self._rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                        self._lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                    cur_reward_sum[new_ids] = 0
+                    cur_episode_length[new_ids] = 0
+
+                    # Per-pool success tracking. Drop ``corrupted_camera``-
+                    # terminated envs from the success rate — it's a rendering
+                    # glitch, not a policy failure.
+                    if success_term is not None:
                         valid_dones = dones
                         try:
                             corrupted = self.env.unwrapped.termination_manager.get_term("corrupted_camera")
                             valid_dones = dones & ~corrupted.to(dones.device)
                         except (KeyError, AttributeError):
-                            pass  # corrupted_camera term not present — fall through
+                            pass
                         done_ids = valid_dones.view(-1).nonzero(as_tuple=False).view(-1)
                         if done_ids.numel() > 0:
-                            succ = progress_term.success[done_ids].float()
-                            eval_m = self.eval_mask.to(dones.device)[done_ids]
-                            student_m = self.student_mask.to(dones.device)[done_ids]
-                            student_eval_m = student_m & eval_m
-                            teacher_eval_m = ~student_m & eval_m
-                            student_train_m = student_m & ~eval_m
-                            teacher_train_m = ~student_m & ~eval_m
-                            self._student_eval_success_buf.extend(succ[student_eval_m].detach().cpu().tolist())
-                            self._teacher_eval_success_buf.extend(succ[teacher_eval_m].detach().cpu().tolist())
-                            self._student_train_success_buf.extend(succ[student_train_m].detach().cpu().tolist())
-                            self._teacher_success_buf.extend(succ[teacher_train_m].detach().cpu().tolist())
+                            succ = success_term[done_ids].float()
+                            eval_m = self.eval_mask[done_ids]
+                            student_m = self.student_mask[done_ids]
+                            self._student_eval_success_buf.extend(
+                                succ[student_m & eval_m].detach().cpu().tolist()
+                            )
+                            self._teacher_eval_success_buf.extend(
+                                succ[~student_m & eval_m].detach().cpu().tolist()
+                            )
+                            self._student_train_success_buf.extend(
+                                succ[student_m & ~eval_m].detach().cpu().tolist()
+                            )
+                            self._teacher_train_success_buf.extend(
+                                succ[~student_m & ~eval_m].detach().cpu().tolist()
+                            )
+                            # Per-reset-bucket breakdown: attribute each done env's
+                            # success to its reset strategy (sampled_tags) x pool.
+                            if _pre_tags is not None:
+                                tags_d = _pre_tags[done_ids].to(succ.device)
+                                pools = {
+                                    "student_train": student_m & ~eval_m,
+                                    "teacher_train": ~student_m & ~eval_m,
+                                    "student_eval": student_m & eval_m,
+                                    "teacher_eval": ~student_m & eval_m,
+                                }
+                                for ti, tname in enumerate(_bucket_names):
+                                    tag_m = tags_d == ti
+                                    if not tag_m.any():
+                                        continue
+                                    for pool, pmask in pools.items():
+                                        sel = pmask & tag_m
+                                        if sel.any():
+                                            self._bucket_success[(pool, tname)].extend(
+                                                succ[sel].detach().cpu().tolist()
+                                            )
 
-                    if self.log_dir is not None:
-                        if "episode" in extras:
-                            ep_infos.append(extras["episode"])
-                        elif "log" in extras:
-                            ep_infos.append(extras["log"])
-                        cur_reward_sum += rewards
-                        cur_episode_length += 1
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
+                    # Also let the new logger pull standard episode info.
+                    self.logger.process_env_step(rewards, dones, extras, None)
 
-                stop = time.time()
-                collection_time = stop - start
-                start = stop
+                collect_time = time.time() - start
+                start = time.time()
 
-            # Switch to train mode for the gradient update so the encoder's
-            # photometric augs fire on the training batch (eval-pool transitions
-            # are masked out of the loss by ``eval_mask``).
-            self.train_mode()
+            # Switch to train mode for the gradient update.
+            self.alg.policy.train()
             loss_dict = self.alg.update()
-
-            stop = time.time()
-            learn_time = stop - start
+            learn_time = time.time() - start
             self.current_learning_iteration = it
 
-            if self.log_dir is not None and not self.disable_logs:
-                # Inject rolling per-pool success into ep_infos so it logs alongside
-                # other Metrics/* keys (rsl_rl's log() uses the first ep_info's keys
-                # as the schema, so inject into every entry for safety).
-                pool_extras = {}
-                if len(self._student_train_success_buf) > 0:
-                    pool_extras["Metrics/success_student_train"] = sum(self._student_train_success_buf) / len(
-                        self._student_train_success_buf
-                    )
-                if len(self._teacher_success_buf) > 0:
-                    pool_extras["Metrics/success_teacher_train"] = sum(self._teacher_success_buf) / len(
-                        self._teacher_success_buf
-                    )
-                if len(self._student_eval_success_buf) > 0:
-                    pool_extras["Metrics/success_student_eval"] = sum(self._student_eval_success_buf) / len(
-                        self._student_eval_success_buf
-                    )
-                if len(self._teacher_eval_success_buf) > 0:
-                    pool_extras["Metrics/success_teacher_eval"] = sum(self._teacher_eval_success_buf) / len(
-                        self._teacher_eval_success_buf
-                    )
-                if len(self._bc_loss_student_eval_buf) > 0:
-                    pool_extras["Metrics/bc_loss_student_eval"] = sum(self._bc_loss_student_eval_buf) / len(
-                        self._bc_loss_student_eval_buf
-                    )
-                if pool_extras:
-                    if not ep_infos:
-                        ep_infos.append(pool_extras)
-                    else:
-                        for ep in ep_infos:
-                            ep.update(pool_extras)
+            # Standard PPO-style log; rnd_weight=None (no RND on distillation).
+            # ``action_std`` only exists on stochastic policies; for the
+            # student-teacher policy stack the closest analogue is the student
+            # std, but it's not a model-wide attribute. Fall back to a 1-tensor
+            # of ones so the logger's mean/std step doesn't crash.
+            action_std = getattr(self.alg.policy, "std", None)
+            if action_std is None:
+                log_std = getattr(self.alg.policy, "log_std", None)
+                action_std = torch.exp(log_std) if log_std is not None else torch.ones(1, device=self.device)
+            self.logger.log(
+                it=it,
+                start_it=start_it,
+                total_it=total_it,
+                collect_time=collect_time,
+                learn_time=learn_time,
+                loss_dict=loss_dict,
+                learning_rate=self.alg.learning_rate,
+                action_std=action_std,
+                rnd_weight=None,
+                policy_metrics=None,
+            )
 
-                self.log(locals())
-                if it % self.save_interval == 0:
-                    self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+            # Append per-pool success metrics directly to the writer (the
+            # standard logger pipeline doesn't carry an injection point for
+            # arbitrary scalars after ``log`` returns).
+            writer = self.logger.writer
+            if writer is not None:
+                if self._student_train_success_buf:
+                    writer.add_scalar(
+                        "Metrics/success_student_train",
+                        statistics.mean(self._student_train_success_buf),
+                        it,
+                    )
+                if self._teacher_train_success_buf:
+                    writer.add_scalar(
+                        "Metrics/success_teacher_train",
+                        statistics.mean(self._teacher_train_success_buf),
+                        it,
+                    )
+                if self._student_eval_success_buf:
+                    writer.add_scalar(
+                        "Metrics/success_student_eval",
+                        statistics.mean(self._student_eval_success_buf),
+                        it,
+                    )
+                if self._teacher_eval_success_buf:
+                    writer.add_scalar(
+                        "Metrics/success_teacher_eval",
+                        statistics.mean(self._teacher_eval_success_buf),
+                        it,
+                    )
+                # Per-reset-bucket success (pool x strategy), e.g.
+                # SuccessBucket/student_train/start_assembled.
+                for (pool, tname), buf in self._bucket_success.items():
+                    if buf:
+                        writer.add_scalar(f"SuccessBucket/{pool}/{tname}", statistics.mean(buf), it)
+                if self._bc_loss_student_eval_buf:
+                    writer.add_scalar(
+                        "Metrics/bc_loss_student_eval",
+                        statistics.mean(self._bc_loss_student_eval_buf),
+                        it,
+                    )
 
-            ep_infos.clear()
-            if it == start_iter and not self.disable_logs and store_code_state is not None:
-                git_file_paths = store_code_state(self.log_dir, self.git_status_repos)
-                if self.logger_type in ["wandb", "neptune"] and git_file_paths:
-                    for path in git_file_paths:
-                        self.writer.save_file(path)
+            # Save model
+            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
+                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
 
-        if self.log_dir is not None and not self.disable_logs:
-            self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+        if self.logger.writer is not None:
+            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
+            self.logger.stop_logging_writer()

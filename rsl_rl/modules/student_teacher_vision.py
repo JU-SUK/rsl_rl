@@ -189,6 +189,7 @@ class StudentTeacherVision(StudentTeacher):
         aux_hidden_dims: tuple[int, ...] | list[int] = (256, 128),
         predict_std: bool = False,
         teacher_returns_std: bool = False,
+        squash_student: bool = False,
         aux_target_keys: list[str] | None = None,
         **kwargs,
     ) -> None:
@@ -362,6 +363,14 @@ class StudentTeacherVision(StudentTeacher):
         # legacy callers (e.g. ``DistillationDAgger.act`` for action routing).
         self.teacher_returns_std = bool(teacher_returns_std)
 
+        # When True the executed/returned action is ``tanh(student_head)`` so the student
+        # is the SAME distribution class as the tanh-squashed teacher (action = tanh(u),
+        # u ~ N(mu, sigma)). The mean head then represents the teacher's saturating
+        # actions directly instead of an unbounded head regressing toward the mean. std
+        # stays in pre-tanh u-space to match the teacher's exported std; means are
+        # compared post-tanh in the weighted-L2 loss.
+        self.squash_student = bool(squash_student)
+
         self.distribution = None
 
     def _set_backbone_requires_grad(self, flag: bool) -> None:
@@ -457,11 +466,13 @@ class StudentTeacherVision(StudentTeacher):
     def act(self, obs: TensorDict) -> torch.Tensor:
         feat = self._encode_student(obs)
         self._update_distribution(feat)
-        return self.distribution.sample()
+        sample = self.distribution.sample()
+        return torch.tanh(sample) if self.squash_student else sample
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         feat = self._encode_student(obs)
-        return self.student(feat)
+        mean = self.student(feat)
+        return torch.tanh(mean) if self.squash_student else mean
 
     def evaluate(self, obs: TensorDict) -> torch.Tensor:
         teacher_obs = self._encode_teacher(obs)
@@ -506,6 +517,8 @@ class StudentTeacherVision(StudentTeacher):
         img_feats = self._encode_vision(obs)
         feat = torch.cat([proprio, img_feats], dim=-1)
         mean = self.student(feat)
+        if self.squash_student:
+            mean = torch.tanh(mean)
         log_std = self.std_head(feat).clamp(-5.0, 2.0)
         std = torch.exp(log_std)
         aux_pred: dict[str, torch.Tensor] | None = None
@@ -519,6 +532,8 @@ class StudentTeacherVision(StudentTeacher):
             raise RuntimeError("act_inference_with_std called but predict_std=False")
         feat = self._encode_student(obs)
         mean = self.student(feat)
+        if self.squash_student:
+            mean = torch.tanh(mean)
         # Clamp to prevent pathological drift during long DAgger training.
         # Init bias = log(init_noise_std) ≈ -2.3 sits well inside this range.
         log_std = self.std_head(feat).clamp(-5.0, 2.0)

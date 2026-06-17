@@ -31,11 +31,65 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
-from rsl_rl.algorithms import Distillation
+from rsl_rl.algorithms import DistillationLegacy
+from rsl_rl.utils import resolve_callable
 
 
-class DistillationDAgger(Distillation):
-    """DAgger with β-annealed mixing or fixed per-env pool split + optional eval pool."""
+class DistillationDAgger(DistillationLegacy):
+    """DAgger with β-annealed mixing or fixed per-env pool split + optional eval pool.
+
+    Built against the legacy single-policy Distillation API (patrickhaoy/main).
+    On feature/manipulation the upstream :class:`rsl_rl.algorithms.Distillation`
+    was refactored to a two-model (student + teacher) API; we keep that as
+    :class:`DistillationLegacy` and inherit from it here so the pat-gravity DAgger
+    recipe ports without rewrite.
+    """
+
+    @staticmethod
+    def construct_algorithm(obs, env, cfg: dict, device: str) -> "DistillationDAgger":
+        """Build the algorithm using the legacy single-policy API.
+
+        Matches ``patrickhaoy/main:rsl_rl/runners/distillation_runner.py:_construct_algorithm``:
+
+          1. resolve policy class from ``cfg["policy"]["class_name"]`` (the JIT-teacher-aware
+             student-teacher wrapper, e.g. :class:`StudentTeacherVision`),
+          2. instantiate the policy with ``(obs, obs_groups, num_actions, **policy_cfg)``,
+          3. resolve the algorithm class (this class or a subclass) and instantiate
+             with ``(policy, device=..., **algorithm_cfg, multi_gpu_cfg=...)``,
+          4. call ``alg.init_storage(...)`` so :class:`rsl_rl.storage.RolloutStorage` is
+             materialized once obs shapes are known.
+
+        The runner (:class:`rsl_rl.runners.OnPolicyRunner.__init__`) invokes this as
+        ``alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)``.
+        """
+        # ``vision_policy`` (not ``policy``) so the IsaacLab back-compat shim
+        # ``handle_deprecated_rsl_rl_cfg`` doesn't strip the field.
+        policy_cfg = dict(cfg.get("vision_policy") or cfg.get("policy"))
+        policy_class = resolve_callable(policy_cfg.pop("class_name"))
+        policy = policy_class(obs, cfg["obs_groups"], env.num_actions, **policy_cfg).to(device)
+
+        # The logger consults algorithm.rnd_cfg / symmetry_cfg; ensure they are
+        # present so it doesn't KeyError when DAgger doesn't use them.
+        cfg["algorithm"].setdefault("rnd_cfg", None)
+        cfg["algorithm"].setdefault("symmetry_cfg", None)
+
+        alg_cfg = dict(cfg["algorithm"])
+        alg_class = resolve_callable(alg_cfg.pop("class_name"))
+        # rnd_cfg / symmetry_cfg are accepted by the legacy Distillation base
+        # only via filter — not a kwarg — so drop them from the kwargs dict.
+        alg_cfg.pop("rnd_cfg", None)
+        alg_cfg.pop("symmetry_cfg", None)
+        alg: "DistillationDAgger" = alg_class(
+            policy, device=device, **alg_cfg, multi_gpu_cfg=cfg.get("multi_gpu")
+        )
+        alg.init_storage(
+            "distillation",
+            env.num_envs,
+            cfg["num_steps_per_env"],
+            obs,
+            [env.num_actions],
+        )
+        return alg
 
     def __init__(
         self,
@@ -130,7 +184,10 @@ class DistillationDAgger(Distillation):
             for epoch in range(self.num_learning_epochs):
                 self.policy.reset(hidden_states=self.last_hidden_states)
                 self.policy.detach_hidden_states()
-                for obs, _, privileged_actions, dones in self.storage.generator():
+                for batch in self.storage.generator():
+                    obs = batch.observations
+                    privileged_actions = batch.privileged_actions
+                    dones = batch.dones
                     if aux_enabled:
                         actions, aux_pred = self.policy.forward_with_aux(obs)
                         aux_target = self.policy.get_aux_target(obs)
