@@ -211,46 +211,59 @@ class StudentTeacherVision(StudentTeacher):
         # history. With ``flatten_history_dim=False`` on RGB obs terms, the
         # group shape is (B, T, C, H, W) and the encoder processes each frame
         # independently (DP-style).
-        first_img = obs[self.vision_groups[0]]
-        if first_img.ndim == 4:
+        # Scalar-only student: ``vision_groups=[]`` skips the encoder stack
+        # entirely (e.g. a pure proprio+pointcloud DAgger student with no
+        # cameras). vision_feat_dim collapses to 0 and the student MLP runs on
+        # the policy (scalar) groups alone. Non-empty vision_groups is unchanged.
+        if not self.vision_groups:
             self.n_obs_steps = 1
-            _, in_channels, H, W = first_img.shape
-        elif first_img.ndim == 5:
-            _, self.n_obs_steps, in_channels, H, W = first_img.shape
-        else:
-            raise AssertionError(
-                f"vision group {self.vision_groups[0]} must be 4D (B,C,H,W) "
-                f"or 5D (B,T,C,H,W); got shape {first_img.shape}"
-            )
-        for g in self.vision_groups[1:]:
-            assert obs[g].shape == first_img.shape, (
-                f"all vision groups must share shape; {g} has {obs[g].shape} vs {first_img.shape}"
-            )
-
-        # Per-view image encoders (DP/DEXTRAH style — no shared weights across
-        # cameras). Each camera gets its own ResNet18+GroupNorm; pretrained
-        # weights are loaded into each independently. ``depth_cnn`` keeps
-        # the older shared encoder for non-RGB legacy paths.
-        if encoder_type == "depth_cnn":
-            shared_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
-            self.encoders = nn.ModuleDict({g: shared_encoder for g in self.vision_groups})
+            self.encoders = nn.ModuleDict()
             self._per_view_encoders = False
-        elif encoder_type == "resnet18":
-            self.encoders = nn.ModuleDict({
-                g: ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path)
-                for g in self.vision_groups
-            })
-            self._per_view_encoders = True
+            self.depth_encoder = None
+            in_channels = H = W = None
+            vision_feat_dim = 0
+            print("[StudentTeacherVision] vision_groups empty -> scalar-only student (no image encoders)")
         else:
-            raise ValueError(f"Unknown encoder_type: {encoder_type}")
-        # Keep legacy attribute name for backward compat (recurrent variant).
-        self.depth_encoder = next(iter(self.encoders.values()))
-        # Vision feature is per-view + per-frame concatenated.
-        vision_feat_dim = len(self.vision_groups) * self.n_obs_steps * embed_dim
-        print(
-            f"Encoders: {len(self.encoders)} views x {self.n_obs_steps} frames "
-            f"x {embed_dim} embed = {vision_feat_dim} vision_feat_dim"
-        )
+            first_img = obs[self.vision_groups[0]]
+            if first_img.ndim == 4:
+                self.n_obs_steps = 1
+                _, in_channels, H, W = first_img.shape
+            elif first_img.ndim == 5:
+                _, self.n_obs_steps, in_channels, H, W = first_img.shape
+            else:
+                raise AssertionError(
+                    f"vision group {self.vision_groups[0]} must be 4D (B,C,H,W) "
+                    f"or 5D (B,T,C,H,W); got shape {first_img.shape}"
+                )
+            for g in self.vision_groups[1:]:
+                assert obs[g].shape == first_img.shape, (
+                    f"all vision groups must share shape; {g} has {obs[g].shape} vs {first_img.shape}"
+                )
+
+            # Per-view image encoders (DP/DEXTRAH style — no shared weights across
+            # cameras). Each camera gets its own ResNet18+GroupNorm; pretrained
+            # weights are loaded into each independently. ``depth_cnn`` keeps
+            # the older shared encoder for non-RGB legacy paths.
+            if encoder_type == "depth_cnn":
+                shared_encoder = DepthCNN(in_channels, H, W, embed_dim=embed_dim)
+                self.encoders = nn.ModuleDict({g: shared_encoder for g in self.vision_groups})
+                self._per_view_encoders = False
+            elif encoder_type == "resnet18":
+                self.encoders = nn.ModuleDict({
+                    g: ResNet18Encoder(in_channels, embed_dim=embed_dim, pretrained_path=encoder_pretrained_path)
+                    for g in self.vision_groups
+                })
+                self._per_view_encoders = True
+            else:
+                raise ValueError(f"Unknown encoder_type: {encoder_type}")
+            # Keep legacy attribute name for backward compat (recurrent variant).
+            self.depth_encoder = next(iter(self.encoders.values()))
+            # Vision feature is per-view + per-frame concatenated.
+            vision_feat_dim = len(self.vision_groups) * self.n_obs_steps * embed_dim
+            print(
+                f"Encoders: {len(self.encoders)} views x {self.n_obs_steps} frames "
+                f"x {embed_dim} embed = {vision_feat_dim} vision_feat_dim"
+            )
 
         # DEXTRAH-style frozen-backbone warmup. If > 0, backbone starts with
         # ``requires_grad=False`` and is unfrozen once the algorithm hits
@@ -265,7 +278,8 @@ class StudentTeacherVision(StudentTeacher):
         # Action head: [proprio ; per-cam image features] → num_actions.
         self.student = MLP(num_proprio + vision_feat_dim, num_actions, list(student_hidden_dims), activation)
         print(f"Student (proprio={num_proprio}, vision_feat={vision_feat_dim}): {self.student}")
-        print(f"Encoder[{encoder_type}] (C={in_channels}, H={H}, W={W}, embed={embed_dim})")
+        if self.vision_groups:
+            print(f"Encoder[{encoder_type}] (C={in_channels}, H={H}, W={W}, embed={embed_dim})")
 
         # Optional aux head: regresses object-pose targets from vision features only.
         # Forces the CNN to learn pose-aware features (per DEXTRAH).
@@ -407,6 +421,11 @@ class StudentTeacherVision(StudentTeacher):
         (B, T, embed_dim), flatten to (B, T*embed_dim). Concat across views.
         Single-frame (4D) inputs are auto-promoted to T=1.
         """
+        if not self.vision_groups:
+            # Scalar-only student: no image features. Return a (B, 0) tensor so
+            # the downstream ``cat([proprio, img_feats])`` is a no-op.
+            ref = obs[self.obs_groups["policy"][0]]
+            return ref.new_zeros((ref.shape[0], 0))
         feats = []
         for g in self.vision_groups:
             img = obs[g]
