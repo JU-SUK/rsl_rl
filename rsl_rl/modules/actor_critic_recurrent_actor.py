@@ -47,6 +47,7 @@ class ActorCriticRecurrentActor(ActorCriticRecurrent):
         num_actions: int,
         critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
         activation: str = "elu",
+        rnn_layer_norm: bool = False,
         **kwargs,
     ) -> None:
         # Build the full recurrent actor-critic first (actor RNN+MLP, normalizers, noise),
@@ -59,6 +60,15 @@ class ActorCriticRecurrentActor(ActorCriticRecurrent):
             activation=activation,
             **kwargs,
         )
+
+        # Optional LayerNorm on the actor LSTM output before the MLP (play2perfect uses this):
+        # normalizes the recurrent features so the MLP sees a stable, well-scaled input from
+        # step 0 (the LSTM output is near-zero early in training, collapsing state-conditioned
+        # action diversity). Identity when disabled -> no behavior change.
+        rnn_hidden_dim = self.memory_a.rnn.hidden_size
+        self.actor_ln = torch.nn.LayerNorm(rnn_hidden_dim) if rnn_layer_norm else torch.nn.Identity()
+        if rnn_layer_norm:
+            print(f"Actor LSTM output LayerNorm: {self.actor_ln}")
 
         # Replace the critic: plain MLP on the raw critic observations, no memory.
         num_critic_obs = 0
@@ -74,6 +84,20 @@ class ActorCriticRecurrentActor(ActorCriticRecurrent):
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.memory_a.reset(dones)
+
+    def act(self, obs: TensorDict, masks=None, hidden_state: HiddenState = None) -> torch.Tensor:
+        # Same as the parent, with LayerNorm applied to the LSTM output before the actor MLP.
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        out_mem = self.actor_ln(self.memory_a(actor_obs, masks, hidden_state).squeeze(0))
+        self._update_distribution(out_mem)
+        return self.distribution.sample()
+
+    def act_inference(self, obs: TensorDict) -> torch.Tensor:
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        out_mem = self.actor_ln(self.memory_a(actor_obs).squeeze(0))
+        if self.state_dependent_std:
+            return self.actor(out_mem)[..., 0, :]
+        return self.actor(out_mem)
 
     def evaluate(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
